@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Тумблер попапа opencode: показать/скрыть (по длинному нажатию Copilot).
+
+Если фоновый oc-popup не запущен — стартует его и ждёт появления сокета.
+"""
+
+import os
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+SOCK = Path(RUNTIME) / "oc-popup.sock"
+BIN = str(Path.home() / ".local/bin" / "oc-popup")
+LOG = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "oc-popup" / "toggle.log"
+
+
+def log(msg):
+    try:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        with LOG.open("a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
+
+
+def send(cmd="toggle", timeout=0.4):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(str(SOCK))
+        s.sendall(cmd.encode())
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def find_xauthority():
+    """XWayland-аутентификация: /run/user/<uid>/xauth_<random> есть только в
+    окружении сессии. Если нас позвали через runuser — берём его у plasmashell."""
+    if os.environ.get("XAUTHORITY"):
+        return os.environ["XAUTHORITY"]
+    import glob as _glob
+    for pat in (f"{RUNTIME}/xauth_*", str(Path.home() / ".Xauthority")):
+        hits = _glob.glob(pat)
+        if hits:
+            return hits[0]
+    try:
+        r = subprocess.run(["pgrep", "-x", "plasmashell"], capture_output=True, text=True)
+        pid = r.stdout.split()[0]
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            for kv in f.read().split(b"\0"):
+                if kv.startswith(b"XAUTHORITY="):
+                    return kv.decode().split("=", 1)[1]
+    except Exception:
+        pass
+    return None
+
+
+def main():
+    if send():
+        log("toggle отправлен (инстанс уже работал)")
+        return 0
+
+    log("oc-popup не запущен — стартую")
+    env = dict(os.environ)
+    xa = find_xauthority()
+    if xa:
+        env["XAUTHORITY"] = xa
+    try:
+        subprocess.Popen([BIN], env=env, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True, cwd=str(Path.home()))
+    except OSError as e:
+        log(f"не удалось запустить {BIN}: {e}")
+        return 1
+
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if send():
+            return 0
+        time.sleep(0.15)
+    log("сокет не появился за 20с")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

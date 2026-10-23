@@ -1,0 +1,1253 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Оверлей нейросети</title>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<script src="marked.min.js"></script>
+<style>
+  :root {
+    --glass: rgba(250, 250, 252, 0.82);
+    --glass-strong: rgba(255, 255, 255, 0.9);
+    --edge: rgba(0, 0, 0, 0.09);
+    --edge-hi: rgba(255, 255, 255, 0.7);
+    --text: #14161b;
+    --text-dim: rgba(20, 22, 27, 0.58);
+    --chip: rgba(255, 255, 255, 0.8);
+    --code: rgba(20, 22, 27, 0.07);
+    --run: #2f6df6;
+    --ok: #1f9d63;
+    --err: #d6403a;
+    --shadow: 0 4px 14px rgba(20, 30, 60, 0.16);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: transparent !important; }
+  body {
+    font: 14.5px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    color: var(--text);
+    overflow: hidden;
+  }
+
+  .stack {
+    position: fixed;
+    right: 24px; bottom: 24px;
+    width: 560px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+
+  /* ───── show / hide: панели выезжают снизу ───── */
+  .stack > * {
+    transform-origin: 50% 100%;
+    transition: opacity .3s ease, transform .55s cubic-bezier(.22,1,.36,1);
+  }
+  .stack > .tools { transition-delay: 0s; }
+  .stack > .inp { transition-delay: .04s; }
+  .stack > .out { transition-delay: .09s; }
+  .stack.closed { pointer-events: none; visibility: hidden; transition: visibility 0s .45s; }
+  .stack.closed > * {
+    opacity: 0; transform: translateY(70px) scale(.94);
+    transition: opacity .22s ease, transform .4s cubic-bezier(.5,0,.75,0);
+  }
+  .stack.closed > .out { transition-delay: 0s; }
+  .stack.closed > .inp { transition-delay: .04s; }
+  .stack.closed > .tools { transition-delay: .08s; }
+
+  /* ───── command palette (Ctrl+P) ───── */
+  .meta {
+    position: absolute; top: 8px; right: 10px; z-index: 1;
+    display: flex; gap: 8px; align-items: center;
+    border: 0; background: transparent; color: var(--text-dim);
+    font: inherit; font-size: 12.5px; padding: 4px 8px; border-radius: 8px; cursor: pointer;
+  }
+  .meta b { font-weight: 600; color: var(--text); }
+  .meta:hover { background: var(--code); }
+  #usage { font-variant-numeric: tabular-nums; opacity: .85; }
+  .meta:focus-visible, .pal-back:focus-visible { outline: 2px solid var(--run); outline-offset: 1px; }
+
+  .palette {
+    position: absolute; inset: 0; z-index: 3; display: flex; flex-direction: column;
+    background: var(--glass-strong);
+    opacity: 0; transform: translateY(8px); visibility: hidden;
+    transition: opacity .18s ease, transform .26s cubic-bezier(.22,1,.36,1), visibility 0s .26s;
+  }
+  .palette.open { opacity: 1; transform: none; visibility: visible; transition-delay: 0s; }
+  .pal-head { display: flex; align-items: center; gap: 4px; padding: 10px 12px 8px 14px; border-bottom: 1px solid var(--edge); }
+  .pal-back {
+    display: none; flex: none; width: 28px; height: 28px; border: 0; border-radius: 8px;
+    background: transparent; color: var(--text-dim); cursor: pointer; place-items: center;
+  }
+  .pal-back:hover { background: var(--code); color: var(--text); }
+  .palette.sub .pal-back { display: grid; }
+  .pal-back svg { width: 16px; height: 16px; }
+  #palq { flex: 1; min-width: 0; border: 0; background: transparent; color: var(--text); font: inherit; padding: 6px 2px; }
+  #palq::placeholder { color: var(--text-dim); }
+  #palq:focus { outline: none; }
+  .pal-list { flex: 1; overflow-y: auto; list-style: none; margin: 0; padding: 4px 8px 8px; scrollbar-width: thin; scrollbar-color: var(--text-dim) transparent; }
+  .pal-group { padding: 10px 10px 4px; font-size: 12px; font-weight: 600; color: var(--text-dim); }
+  .pal-item { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 10px; cursor: pointer; }
+  .pal-item.active { background: var(--code); }
+  .pal-item .d { margin-left: auto; color: var(--text-dim); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pal-item .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pal-item .on { color: var(--ok); font-weight: 700; }
+  .pal-empty { padding: 18px 12px; color: var(--text-dim); }
+
+  .glass {
+    background: var(--glass);
+    border: 1px solid var(--edge);
+    box-shadow: var(--shadow), inset 0 1px 0 var(--edge-hi);
+    border-radius: 18px;
+  }
+
+  /* ───── tool chips ───── */
+  .tools {
+    display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
+    min-height: 0;
+  }
+  .chip {
+    display: inline-flex; flex-direction: column; align-items: stretch;
+    max-width: 100%;
+    padding: 6px 12px 6px 10px;
+    background: var(--chip);
+    border: 1px solid var(--edge);
+    border-radius: 999px;
+    box-shadow: 0 3px 10px rgba(0,0,0,0.10), inset 0 1px 0 var(--edge-hi);
+    font-size: 12.5px;
+    animation: chip-in .28s cubic-bezier(.2,.8,.2,1);
+  }
+  .chip { width: max(50%, min(100%, 260px)); transition: width .4s cubic-bezier(.22,1,.36,1), border-radius .3s ease; }
+  .chip .row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .chip.expandable .row { cursor: pointer; }
+  .chip.expandable .row:focus-visible { outline: 2px solid var(--run); outline-offset: 4px; border-radius: 10px; }
+  .chip.expanded { width: 100%; border-radius: 16px; }
+  .chip.expanded .arg { display: none; }
+  .chip .arg { flex: 1 1 auto; min-width: 0; }
+  .chip .time { margin-left: auto; }
+  .chip .chev { flex: none; width: 10px; height: 10px; color: var(--text-dim); transition: transform .25s ease; }
+  .chip.expanded .chev { transform: rotate(180deg); }
+  .full-wrap { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .32s cubic-bezier(.22,1,.36,1); }
+  .chip.expanded .full-wrap { grid-template-rows: 1fr; }
+  .full { min-height: 0; overflow: hidden; }
+  .full-in {
+    padding-top: 6px; user-select: text; cursor: text;
+    font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .chip.leaving { opacity: 0; transform: translateY(4px); transition: opacity .35s, transform .35s; }
+  @keyframes chip-in { from { opacity: 0; transform: translateY(6px) scale(.96); } }
+
+  .chip .dot { flex: none; width: 9px; height: 9px; border-radius: 50%; background: var(--run); }
+  .chip.running .dot {
+    background: transparent;
+    border: 2px solid var(--run); border-right-color: transparent;
+    width: 11px; height: 11px;
+    animation: spin .8s linear infinite;
+  }
+  .chip.done .dot { background: var(--ok); }
+  .chip.error .dot { background: var(--err); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .chip b { font-weight: 600; }
+  .chip .arg {
+    font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: var(--text-dim);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .chip .time { flex: none; color: var(--text-dim); font-variant-numeric: tabular-nums; font-size: 12px; }
+
+  /* ───── output panel ───── */
+  .out { position: relative; display: flex; flex-direction: column; height: min(46vh, 380px); overflow: hidden; }
+  .scan { display: flex; justify-content: space-between; width: 50%; padding: 14px 0 4px 18px; flex: none; }
+  .scan i { width: 11px; height: 11px; border-radius: 3px; background: var(--run); opacity: .16; }
+  .send:focus-visible, textarea:focus-visible { outline: 2px solid var(--run); outline-offset: 1px; }
+  .stack.edge-hover { cursor: grab; }
+  .stack.dragging, .stack.dragging * { cursor: grabbing !important; }
+
+  /* ───── очередь сообщений: колонка слева, стиль команд ───── */
+  #queue {
+    position: fixed;
+    left: 10px; bottom: 28px;
+    width: 216px;
+    display: flex; flex-direction: column; gap: 6px;
+    pointer-events: none; z-index: 2;
+  }
+  .chip.queued { width: 100%; border-radius: 16px; pointer-events: auto; }
+  #queue .chip.pending { display: none; }
+  .chip.queued.expanded .full-in { font-size: 12.5px; }
+  .chip.queued .chev { margin-left: auto; }
+  /* чип в полёте: перетекает из очереди в панель вывода */
+  .chip.flying {
+    position: fixed; margin: 0; z-index: 40; pointer-events: none;
+    animation: none; transition: none; overflow: hidden; box-shadow: none;
+  }
+
+  .out-body {
+    flex: 1; overflow-y: auto; padding: 8px 18px 16px;
+    scrollbar-width: thin; scrollbar-color: var(--text-dim) transparent;
+  }
+  .out-body p { margin: 0 0 10px; max-width: 70ch; }
+  .out-body code {
+    font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--code); padding: 1px 6px; border-radius: 6px;
+  }
+  .out-body pre {
+    margin: 4px 0 12px; padding: 10px 12px; border-radius: 12px;
+    background: var(--code); overflow-x: auto;
+    font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .out-body pre code { background: none; padding: 0; }
+  .think {
+    margin: 0 0 12px; padding: 2px 0 2px 12px;
+    border-left: 2px solid var(--edge);
+    color: var(--text-dim); font-size: 13.5px;
+  }
+  .think .think-label { display: block; font-weight: 600; font-size: 12.5px; margin-bottom: 2px; opacity: .85; }
+  .think .think-text { display: block; font-style: italic; opacity: .8; max-width: 70ch; white-space: pre-wrap; }
+  .think .think-text p { margin: 0 0 6px; }
+  .think .think-text ul, .think .think-text ol { margin: 2px 0 6px; padding-left: 20px; }
+  .think .think-text code {
+    font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--code); padding: 0 4px; border-radius: 4px;
+  }
+  .think .think-text pre {
+    margin: 4px 0 8px; padding: 8px 10px; border-radius: 10px;
+    background: var(--code); font-size: 12px; line-height: 1.5;
+    font-style: normal; white-space: pre-wrap;
+  }
+
+  /* команды в потоке вывода (чипы сверху — только индикатор процесса) */
+  .toolout {
+    margin: 2px 0 10px; padding: 6px 10px;
+    border-left: 2px solid var(--edge);
+    font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: var(--text-dim); cursor: default;
+  }
+  .toolout .to-head { font-weight: 600; margin-bottom: 2px; }
+  .toolout.to-done .to-head { color: var(--ok); }
+  .toolout.to-error .to-head { color: var(--err); }
+  .toolout .to-cmd { margin: 0 0 4px; white-space: pre-wrap; color: var(--text); }
+  .toolout .to-res {
+    margin: 0; white-space: pre-wrap; opacity: .85;
+    max-height: none; overflow: visible;
+  }
+  .toolout.to-folded .to-res {
+    max-height: 72px; overflow: hidden;
+    -webkit-mask-image: linear-gradient(180deg, #000 60%, transparent);
+            mask-image: linear-gradient(180deg, #000 60%, transparent);
+  }
+  .toolout.to-folded { cursor: pointer; }
+
+  /* финальный ответ — обычный яркий цвет текста (как в TUI opencode),
+     серым остаётся только Thinking; акцент — лишь полоска у кода */
+  .answer { color: var(--text); margin: 0 0 12px; }
+  .answer p { color: inherit; margin: 0 0 10px; max-width: 70ch; }
+  .answer pre { border-left: 2px solid var(--run); }
+  .answer .raw { white-space: pre-wrap; }
+  .you { color: var(--text-dim); margin-bottom: 8px !important; }
+  .you > :first-child { margin-top: 0; }
+  .you > :last-child { margin-bottom: 0; }
+  .you p { margin: 0 0 6px; }
+  .answer-p { color: var(--text); }
+
+  /* markdown-разметка (marked) в ответах и истории */
+  .answer h1, .answer h2, .answer h3, .answer h4,
+  .answer-p h1, .answer-p h2, .answer-p h3, .answer-p h4 {
+    margin: 10px 0 6px; line-height: 1.25; color: var(--text);
+  }
+  .answer h1, .answer-p h1 { font-size: 1.25em; }
+  .answer h2, .answer-p h2 { font-size: 1.15em; }
+  .answer h3, .answer h4, .answer-p h3, .answer-p h4 { font-size: 1.05em; }
+  .answer ul, .answer ol, .answer-p ul, .answer-p ol { margin: 4px 0 10px; padding-left: 22px; }
+  .answer li, .answer-p li { margin: 2px 0; }
+  .answer blockquote, .answer-p blockquote {
+    margin: 6px 0; padding: 2px 12px; border-left: 3px solid var(--edge);
+    color: var(--text-dim);
+  }
+  .answer table, .answer-p table { border-collapse: collapse; margin: 6px 0 10px; max-width: 100%; }
+  .answer th, .answer td, .answer-p th, .answer-p td {
+    border: 1px solid var(--edge); padding: 4px 8px; text-align: left;
+  }
+  .answer a, .answer-p a { color: var(--run); }
+  .answer hr, .answer-p hr { border: 0; border-top: 1px solid var(--edge); margin: 10px 0; }
+  .caret::after {
+    content: ""; display: inline-block; width: 7px; height: 1.05em;
+    margin-left: 2px; vertical-align: -2px; background: var(--run);
+    border-radius: 2px; animation: blink 1s steps(2) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* ───── input panel ───── */
+  .inp { display: flex; align-items: flex-end; gap: 8px; padding: 8px 8px 8px 16px; }
+  textarea {
+    flex: 1; resize: none; border: 0; background: transparent; color: var(--text);
+    font: inherit; padding: 8px 0; max-height: 120px; min-height: 22px;
+  }
+  textarea::placeholder { color: var(--text-dim); }
+  textarea:focus { outline: none; }
+  .send {
+    flex: none; border: 0; cursor: pointer;
+    width: 34px; height: 34px; border-radius: 50%;
+    display: grid; place-items: center;
+    background: var(--text); color: var(--glass-strong);
+    transition: opacity .15s, transform .15s;
+  }
+  .send:active { transform: scale(.92); }
+  .send svg { width: 16px; height: 16px; display: block; }
+  .send .ic-stop { display: none; }
+  .send.busy .ic-stop { display: block; }
+  .send.busy .ic-send { display: none; }
+  .send:disabled { opacity: .3; cursor: default; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .stack > *, .stack.closed > * { transform: none; transition-duration: .15s; transition-delay: 0s; }
+    .full-wrap, .chip { transition: none; }
+    .chip, .caret::after { animation: none; }
+    .chip.running .dot { animation-duration: 2s; }
+  }
+</style>
+</head>
+<body>
+
+<main class="stack closed" id="stack">
+  <div class="tools" id="tools" aria-live="polite" aria-label="Команды, которые выполняет OpenCode"></div>
+
+  <div id="queue" aria-label="Сообщения в очереди"></div>
+
+  <section class="glass out" aria-label="Ответ нейросети">
+    <div class="scan" id="scan" aria-hidden="true"></div>
+    <button class="meta" id="meta" title="Команды (Ctrl+P)"><b id="metaAgent">build</b><span id="metaModel">…</span><span id="usage"></span></button>
+    <div class="out-body" id="out"></div>
+    <div class="palette" id="pal" role="dialog" aria-label="Команды OpenCode">
+      <div class="pal-head">
+        <button class="pal-back" id="palBack" aria-label="Назад"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3 5 8l5 5"/></svg></button>
+        <input id="palq" type="text" placeholder="Команды" autocomplete="off" spellcheck="false" role="combobox" aria-expanded="true" aria-controls="pall">
+      </div>
+      <ul class="pal-list" id="pall" role="listbox"></ul>
+    </div>
+  </section>
+
+  <div class="glass inp">
+    <textarea id="ta" rows="1" placeholder="Спросить или поручить задачу…" aria-label="Запрос"></textarea>
+    <button class="send" id="send" aria-label="Отправить" disabled>
+      <svg class="ic-send" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5"/></svg>
+      <svg class="ic-stop" viewBox="0 0 16 16" fill="currentColor"><rect x="3.5" y="3.5" width="9" height="9" rx="1.8"/></svg>
+    </button>
+  </div>
+</main>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const out = $('out'), tools = $('tools'), ta = $('ta'), send = $('send');
+
+  let py = null;
+  window.__pyReady = false;
+
+  /* ── scanner ── */
+  const scan = $('scan');
+  let sq = [];
+  const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  let scanning = false, t0 = 0;
+  function buildScan() {
+    const out = scan.parentElement;
+    if (!out) return;
+    const meta = $('meta');
+    const outR = out.getBoundingClientRect();
+    const metaR = meta.getBoundingClientRect();
+    if (!outR.width || !metaR.width) return;
+    // свободное место: от левого паддинга до начала мета-кнопки
+    const avail = Math.max(0, metaR.left - (outR.left + 18) - 14);
+    // шаг ~30px (как исходные 9 квадратов), число подстраивается под ширину
+    let n = Math.max(2, Math.min(12, Math.round(avail / 30)));
+    if (n !== sq.length) {
+      scan.innerHTML = '';
+      sq = Array.from({length: n}, () => scan.appendChild(document.createElement('i')));
+      if (scanning) sq.forEach(el => { el.style.opacity = '.5'; });
+    }
+    scan.style.width = avail + 'px';
+  }
+  function frame(t) {
+    if (!scanning) return;
+    const period = 1800, ph = ((t - t0) % period) / period;
+    const pos = (ph < .5 ? ph * 2 : (1 - ph) * 2) * (sq.length - 1);
+    sq.forEach((el, i) => { el.style.opacity = Math.max(.16, 1 - Math.abs(i - pos) / 2.2).toFixed(2); });
+    requestAnimationFrame(frame);
+  }
+  function setScanning(on) {
+    scanning = on;
+    if (on && !still) { t0 = performance.now(); requestAnimationFrame(frame); }
+    else sq.forEach(el => { el.style.opacity = on ? '.5' : ''; });
+  }
+  addEventListener('resize', () => buildScan());
+  requestAnimationFrame(() => { buildScan(); setTimeout(buildScan, 300); });
+  addEventListener('load', buildScan);
+
+  /* ── drag за края панелей → двигаем нативное окно ── */
+  const stack = $('stack'), EDGE = 10;
+  const panels = () => [...stack.querySelectorAll('.glass')];
+  function onEdge(e) {
+    if (e.target === stack || e.target === tools) return true;
+    return panels().some(el => {
+      const r = el.getBoundingClientRect();
+      const inside = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+      if (!inside) return false;
+      return e.clientX - r.left < EDGE || r.right - e.clientX < EDGE ||
+             e.clientY - r.top < EDGE || r.bottom - e.clientY < EDGE;
+    });
+  }
+  let drag = null, dragAcc = { x: 0, y: 0 }, dragRaf = 0;
+  function dragFlush() {
+    dragRaf = 0;
+    if (!drag || !py) return;
+    const dx = dragAcc.x, dy = dragAcc.y;
+    dragAcc.x = dragAcc.y = 0;
+    if (dx || dy) py.dragBy(dx, dy);
+  }
+  stack.addEventListener('pointermove', e => {
+    if (drag && !drag.native) {
+      dragAcc.x += e.clientX - drag.x;
+      dragAcc.y += e.clientY - drag.y;
+      drag.x = e.clientX; drag.y = e.clientY;
+      if (!dragRaf) dragRaf = requestAnimationFrame(dragFlush);
+    } else if (!drag) {
+      stack.classList.toggle('edge-hover', onEdge(e));
+    }
+  });
+  stack.addEventListener('pointerdown', e => {
+    if (e.button !== 0 || !onEdge(e)) return;
+    drag = { x: e.clientX, y: e.clientY, native: false };
+    dragAcc.x = dragAcc.y = 0;
+    stack.setPointerCapture(e.pointerId);
+    stack.classList.add('dragging');
+    e.preventDefault();
+    // нативный жест Wayland: окно ведёт композитор
+    if (py) py.beginDrag(ok => { if (ok && drag) drag.native = true; });
+  });
+  const endDrag = () => {
+    if (dragRaf) { cancelAnimationFrame(dragRaf); dragFlush(); }
+    drag = null; stack.classList.remove('dragging');
+  };
+  stack.addEventListener('pointerup', endDrag);
+  stack.addEventListener('pointercancel', endDrag);
+
+  /* ── rendering ── */
+  let aborted = false, busy = false;
+  let followMode = true;   // держим низ, пока пользователь не уехал вверх
+  const isNearBottom = () => out.scrollHeight - out.scrollTop - out.clientHeight < 60;
+  const scroll = () => { if (followMode) out.scrollTop = out.scrollHeight; };
+  out.addEventListener('scroll', () => { followMode = isNearBottom(); });
+  const followBottom = () => { followMode = true; out.scrollTop = out.scrollHeight; };
+  let queue = Promise.resolve();
+  let qPending = 0;
+  const enqueue = fn => {
+    qPending++;
+    queue = queue.then(fn).catch(()=>{}).finally(() => { qPending--; });
+    return queue;
+  };
+  window.__dbg = () => ({ busy, qPending, out: out.children.length });
+
+  function block(tag, cls) {
+    const el = document.createElement(tag);
+    if (cls) el.className = cls;
+    out.appendChild(el);
+    return el;
+  }
+  function speedFor(text, base) { return Math.max(2, Math.min(base, 1100 / Math.max(1, text.length))); }
+  async function typeInto(el, text, base = 14) {
+    el.classList.add('caret');
+    const sp = speedFor(text, base);
+    el.textContent += text;   // live: сразу, без «печати»
+    scroll();
+    el.classList.remove('caret');
+  }
+  async function paragraph(text) {
+    const clean = text.replace(/^#{1,6}\s*/gm, '').replace(/\*\*/g, '');
+    const p = block('p');
+    await typeInto(p, clean.replace(/`/g, ''));
+    p.innerHTML = clean.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))
+                       .replace(/`([^`]+)`/g, '<code>$1</code>');
+  }
+  function paragraphInstant(text, cls) {
+    const clean = text.replace(/^#{1,6}\s*/gm, '').replace(/\*\*/g, '');
+    const p = block('p', cls || undefined);
+    p.innerHTML = clean.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))
+                       .replace(/`([^`]+)`/g, '<code>$1</code>');
+  }
+  /* ── compact: сжатие контекста (стрим сводки) ── */
+  let curCompact = null, curCompactLabel = null, curCompactT0 = 0, curCompactT = null;
+  function compactStart() {
+    const box = block('div', 'think compact');
+    box.innerHTML = '<span class="think-label">Compacting</span><span class="think-text"></span>';
+    curCompact = box.querySelector('.think-text');
+    curCompactLabel = box.querySelector('.think-label');
+    curCompactT0 = performance.now();
+    curCompactT = setInterval(() => {
+      if (curCompactLabel)
+        curCompactLabel.textContent = 'Compacting · ' +
+          ((performance.now() - curCompactT0) / 1000).toFixed(1) + 'с';
+    }, 120);
+    scroll();
+  }
+  function compactDelta(t) {
+    if (!curCompact) compactStart();
+    if (curCompact) curCompact.textContent += t;
+    scroll();
+  }
+  function compactEnd() {
+    if (curCompactT) { clearInterval(curCompactT); curCompactT = null; }
+    const el = curCompact;
+    if (el && window.marked && el.textContent.trim())
+      el.innerHTML = window.marked.parse(el.textContent,
+                                        { breaks: true, gfm: true, silent: true });
+    if (curCompactLabel && curCompactT0)
+      curCompactLabel.textContent = 'Compacted · ' +
+        ((performance.now() - curCompactT0) / 1000).toFixed(1) + 'с';
+    curCompact = null; curCompactLabel = null;
+  }
+  function compactInstant(text) {
+    const box = block('div', 'think compact');
+    box.innerHTML = '<span class="think-label">Compacted</span><span class="think-text"></span>';
+    const el = box.querySelector('.think-text');
+    if (window.marked && (text || '').trim())
+      el.innerHTML = window.marked.parse(text, { breaks: true, gfm: true, silent: true });
+  }
+
+  function thinkInstant(text, ms) {
+    const box = block('div', 'think');
+    box.innerHTML = '<span class="think-label"></span><span class="think-text"></span>';
+    box.querySelector('.think-label').textContent =
+      'Thinking' + (ms ? ' · ' + (ms / 1000).toFixed(1) + 'с' : '');
+    const el = box.querySelector('.think-text');
+    if (window.marked && text.trim())
+      el.innerHTML = window.marked.parse(text, { breaks: true, gfm: true, silent: true });
+    else
+      el.textContent = text;
+  }
+  function codeInstant(code) {
+    const pre = block('pre'), c = document.createElement('code');
+    c.textContent = code;
+    pre.appendChild(c);
+  }
+  async function think(text) {
+    const box = block('div', 'think');
+    box.innerHTML = '<span class="think-label">Think</span><span class="think-text"></span>';
+    await typeInto(box.querySelector('.think-text'), text, 9);
+  }
+  async function codeBlock(code) {
+    const pre = block('pre'), c = document.createElement('code');
+    pre.appendChild(c);
+    await typeInto(c, code, 6);
+  }
+
+  async function tool(name, arg, ms, full, status = 'done') {
+    const el = document.createElement('div');
+    el.className = 'chip running';
+    el.innerHTML = '<div class="row"><span class="dot"></span><b></b><span class="arg"></span><span class="time"></span>' +
+      '<svg class="chev" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3.5 5 6.5l3-3"/></svg></div>' +
+      '<div class="full-wrap"><div class="full"><div class="full-in"></div></div></div>';
+    el.querySelector('b').textContent = name;
+    el.querySelector('.arg').textContent = arg;
+    const row = el.querySelector('.row');
+    if (full && full !== arg) {
+      el.classList.add('expandable');
+      el.querySelector('.full-in').textContent = full;
+      row.tabIndex = 0; row.setAttribute('role', 'button'); row.setAttribute('aria-expanded', 'false');
+      const toggle = () => { const on = el.classList.toggle('expanded'); row.setAttribute('aria-expanded', on); };
+      row.addEventListener('click', toggle);
+      row.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+    } else {
+      el.querySelector('.chev').remove();
+      el.querySelector('.full-wrap').remove();
+    }
+    tools.appendChild(el);
+    const tt0 = performance.now(), timeEl = el.querySelector('.time');
+    const tick = 0;
+    clearInterval(tick);
+    if (ms) timeEl.textContent = (ms / 1000).toFixed(1) + 'с';
+    el.classList.remove('running');
+    el.classList.add(aborted ? 'error' : status);
+    const all = [...tools.children].filter(c => !c.classList.contains('leaving') && !c.classList.contains('expanded'));
+    if (all.length > 3) { const old = all[0]; old.classList.add('leaving'); setTimeout(() => old.remove(), 380); }
+  }
+
+  /* ── очередь сообщений: чипы слева; когда подходит ход — перетекают в вывод ── */
+  const queueEl = $('queue');
+  let queueExpanded = false, flights = 0;
+  const FLIGHT_MS = 640;
+
+  function syncQueue(after) {
+    const n = queueEl.querySelectorAll('.chip').length + flights;
+    queueEl.style.display = n ? 'flex' : 'none';
+    if (!py) { queueExpanded = n > 0; after && after(); return; }
+    if (n > 0 && !queueExpanded) {
+      // окно расширяется влево — чип показываем, когда Python ответил
+      queueExpanded = true;
+      py.setQueue(n, () => setTimeout(() => after && after(), 90));
+    } else {
+      queueExpanded = n > 0;
+      py.setQueue(n);
+      after && after();
+    }
+  }
+  function findQueued(id) {
+    return id == null ? null : queueEl.querySelector('.chip.queued[data-qid="' + id + '"]');
+  }
+  function chipQueuedAdd(id, text) {
+    // стиль команд: спиннер + текст одной строкой; длинное разворачивается по клику
+    const el = document.createElement('div');
+    el.className = 'chip running queued';
+    el.dataset.qid = id;
+    el.innerHTML = '<div class="row"><span class="dot"></span><span class="arg"></span>' +
+      '<svg class="chev" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3.5 5 6.5l3-3"/></svg></div>' +
+      '<div class="full-wrap"><div class="full"><div class="full-in"></div></div></div>';
+    el.querySelector('.arg').textContent = text;
+    el.querySelector('.full-in').textContent = text;
+    const arm = () => {                     // разворачиваемым делаем, только если текст не влезает
+      if (el.dataset.armed) return;
+      el.dataset.armed = '1';
+      const arg = el.querySelector('.arg');
+      if (!(arg.scrollWidth > arg.clientWidth + 1 || text.includes('\n'))) {
+        el.querySelector('.chev').remove(); el.querySelector('.full-wrap').remove(); return;
+      }
+      el.classList.add('expandable');
+      const row = el.querySelector('.row');
+      row.tabIndex = 0; row.setAttribute('role', 'button'); row.setAttribute('aria-expanded', 'false');
+      const toggle = () => { const on = el.classList.toggle('expanded'); row.setAttribute('aria-expanded', on); };
+      row.addEventListener('click', toggle);
+      row.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+    };
+    const first = !queueExpanded;
+    if (first) el.classList.add('pending');
+    queueEl.appendChild(el);
+    let shown = false;
+    const reveal = () => { if (shown) return; shown = true; el.classList.remove('pending'); arm(); };
+    syncQueue(first ? reveal : null);
+    if (first) setTimeout(reveal, 500); else arm();
+  }
+  function chipQueuedDrop(el) {
+    if (!el || el.classList.contains('leaving')) return;
+    el.classList.add('leaving');
+    setTimeout(() => { el.remove(); syncQueue(); }, 380);
+  }
+  // чип доехал до своего хода: перетекает в панель вывода и становится репликой
+  function chipFlyToOut(id, text) {
+    const chip = findQueued(id) || queueEl.querySelector('.chip.queued:not(.leaving)');
+    const msg = text || (chip && chip.querySelector('.full-in, .arg').textContent) || '';
+    // место под реплику занимаем сразу: порядок относительно живого стрима не собьётся
+    const p = block('p', 'you');
+    p.textContent = msg;
+    scroll();
+    const canFly = chip && !still && !stack.classList.contains('closed') &&
+                   typeof chip.animate === 'function' && !chip.classList.contains('pending');
+    if (!canFly) { if (chip) { chip.remove(); syncQueue(); } return; }
+
+    p.style.opacity = '0';
+    const r0 = chip.getBoundingClientRect();
+    const rg = document.createRange(); rg.selectNodeContents(p);
+    const tr = rg.getBoundingClientRect(), ob = out.getBoundingClientRect();
+    const h = Math.max(tr.height, 18), w = Math.max(tr.width, 40);
+    const top = Math.min(Math.max(tr.top, ob.top + 6), ob.bottom - h - 6);
+
+    const clone = chip.cloneNode(true);
+    clone.classList.remove('pending', 'leaving');
+    clone.classList.add('flying');
+    Object.assign(clone.style, { left: r0.left + 'px', top: r0.top + 'px',
+                                 width: r0.width + 'px', height: r0.height + 'px' });
+    document.body.appendChild(clone);
+    chip.remove();
+    flights++;
+
+    const cs = getComputedStyle(clone);
+    const geo = clone.animate([
+      { left: r0.left + 'px', top: r0.top + 'px', width: r0.width + 'px', height: r0.height + 'px',
+        padding: cs.padding, borderRadius: '16px',
+        backgroundColor: cs.backgroundColor, borderColor: cs.borderTopColor },
+      { left: tr.left + 'px', top: top + 'px', width: w + 'px', height: h + 'px',
+        padding: '0px', borderRadius: '6px',
+        backgroundColor: 'rgba(0,0,0,0)', borderColor: 'rgba(0,0,0,0)' },
+    ], { duration: FLIGHT_MS, easing: 'cubic-bezier(.22,1,.36,1)', fill: 'forwards' });
+
+    // спиннер и «в очереди» схлопываются, остаётся текст сообщения
+    ['.dot', '.chev'].forEach(sel => {
+      const el = clone.querySelector(sel);
+      if (!el) return;
+      const w0 = el.getBoundingClientRect().width;
+      el.style.overflow = 'hidden'; el.style.whiteSpace = 'nowrap';
+      el.animate([{ width: w0 + 'px', opacity: 1, marginRight: '0px' },
+                  { width: '0px', opacity: 0, marginRight: '-8px' }],
+                 { duration: FLIGHT_MS * .5, easing: 'ease-in', fill: 'forwards' });
+    });
+    // кроссфейд: клон гаснет, настоящая реплика проявляется
+    clone.animate([{ opacity: 1 }, { opacity: 1, offset: .6 }, { opacity: 0 }],
+                  { duration: FLIGHT_MS, easing: 'linear', fill: 'forwards' });
+    setTimeout(() => { p.style.transition = 'opacity .26s ease'; p.style.opacity = '1'; }, FLIGHT_MS * .6);
+
+    const finish = () => {
+      clone.remove();
+      p.style.transition = ''; p.style.opacity = '';
+      flights = Math.max(0, flights - 1);
+      syncQueue(); scroll();
+    };
+    geo.finished.then(finish, finish);
+  }
+
+  // занят + пусто → «стоп»; занят + есть текст → отправить в очередь
+  function syncSend() {
+    const has = !!ta.value.trim(), stop = busy && !has;
+    send.classList.toggle('busy', stop);
+    send.setAttribute('aria-label', stop ? 'Остановить' : (busy ? 'В очередь' : 'Отправить'));
+    send.disabled = !busy && !has;
+  }
+  function setBusy(on) {
+    busy = on;
+    document.body.dataset.busy = on ? '1' : '0';   // для ди агностики
+    syncSend();
+    ta.placeholder = on ? 'Следующее сообщение встанет в очередь…' : 'Спросить или поручить задачу…';
+    setScanning(on);
+  }
+
+  /* ── живой стрим: think/answer/чипы ── */
+  let curThink = null, curAnswer = null, answerRaw = null, answerBuf = '';
+  const liveChips = new Map();
+
+  function thinkStart() {
+    const box = block('div', 'think');
+    box.innerHTML = '<span class="think-label">Thinking</span><span class="think-text"></span>';
+    box.classList.add('caret');
+    curThink = box.querySelector('.think-text');
+    curThinkLabel = box.querySelector('.think-label');
+    // провайдер отдаёт reasoning одним куском ПОСЛЕ раздумий — показываем живой таймер
+    curThinkT0 = performance.now();
+    curThinkTimer = setInterval(() => {
+      if (curThinkLabel)
+        curThinkLabel.textContent = 'Thinking · ' +
+          ((performance.now() - curThinkT0) / 1000).toFixed(1) + 'с';
+    }, 100);
+    scroll();
+  }
+  let curThinkLabel = null, curThinkT0 = 0, curThinkTimer = null;
+  let thinkQ = '', thinkTimer = null;
+  function thinkPump() {
+    if (!curThink) { thinkQ = ''; thinkTimer = null; return; }
+    if (!thinkQ) { thinkTimer = null; return; }
+    const n = Math.max(1, Math.ceil(thinkQ.length / 25));
+    curThink.textContent += thinkQ.slice(0, n);
+    thinkQ = thinkQ.slice(n);
+    scroll();
+    thinkTimer = setTimeout(thinkPump, 16);
+  }
+  function thinkDelta(t) {
+    if (!curThink) thinkStart();
+    if (curThinkTimer) { clearInterval(curThinkTimer); curThinkTimer = null; }
+    if (curThinkLabel) curThinkLabel.textContent = 'Thinking';
+    thinkQ += t;
+    if (!thinkTimer) thinkPump();
+  }
+  function thinkEnd() {
+    const el = curThink;
+    if (el && thinkQ) { el.textContent += thinkQ; thinkQ = ''; }
+    if (el && window.marked && el.textContent.trim()) {
+      // разметка раздумий: после стрима рендерим накопленное
+      el.innerHTML = window.marked.parse(el.textContent,
+                                        { breaks: true, gfm: true, silent: true });
+    }
+    // финальное время раздумий в заголовке
+    if (curThinkLabel && curThinkT0) {
+      const sec = (performance.now() - curThinkT0) / 1000;
+      curThinkLabel.textContent = 'Thinking · ' + sec.toFixed(1) + 'с';
+    }
+    if (curThinkTimer) { clearInterval(curThinkTimer); curThinkTimer = null; }
+    if (el && el.parentElement) el.parentElement.classList.remove('caret');
+    curThink = null; curThinkLabel = null;
+  }
+  function answerStart() {
+    curAnswer = block('div', 'answer');
+    answerRaw = document.createElement('div');
+    answerRaw.className = 'raw caret';
+    curAnswer.appendChild(answerRaw);
+    answerBuf = '';
+    answerShown = '';
+    scroll();
+  }
+  let answerQ = '', answerShown = '', answerPumpT = null;
+  function answerPump() {
+    if (!curAnswer || !answerRaw) { answerQ = ''; answerPumpT = null; return; }
+    if (!answerQ) { answerPumpT = null; return; }
+    // адаптивно: большой кусок раскрываем ~за секунду, хвосты мгновенно
+    const n = Math.max(1, Math.ceil(answerQ.length / 60));
+    answerShown += answerQ.slice(0, n);
+    answerQ = answerQ.slice(n);
+    answerRaw.textContent = answerShown;
+    scroll();
+    answerPumpT = setTimeout(answerPump, 16);
+  }
+  function answerDelta(t) {
+    if (!curAnswer) answerStart();
+    answerBuf += t;
+    answerQ += t;
+    if (!answerPumpT) answerPump();
+  }
+  function renderMarkdown(el, md) {
+    if (window.marked) {
+      el.innerHTML = window.marked.parse(md, { breaks: true, gfm: true, silent: true });
+    } else {
+      el.textContent = md;
+    }
+  }
+
+  function answerEnd() {
+    if (!curAnswer) return;
+    if (answerPumpT) { clearTimeout(answerPumpT); answerPumpT = null; }
+    answerQ = '';
+    curAnswer.classList.remove('caret');
+    answerRaw && answerRaw.remove();
+    renderMarkdown(curAnswer, answerBuf);
+    curAnswer = null; answerRaw = null; answerBuf = '';
+    scroll();
+  }
+  const toolOuts = new Map();   // id → блок команды в выводе
+  function toolOutStart(id, name) {
+    const el = block('div', 'toolout');
+    el.innerHTML = '<div class="to-head"></div><pre class="to-cmd"></pre><pre class="to-res"></pre>';
+    el.querySelector('.to-head').textContent = '❯ ' + name;
+    el.querySelector('.to-cmd').textContent = '…';
+    toolOuts.set(id, el);
+    scroll();
+  }
+  function toolOutArg(id, arg) {
+    const el = toolOuts.get(id);
+    if (el) { el.querySelector('.to-cmd').textContent = '$ ' + arg; scroll(); }
+  }
+  function toolOutEnd(id, status, output) {
+    const el = toolOuts.get(id);
+    if (!el) return;
+    el.classList.add(status === 'error' ? 'to-error' : 'to-done');
+    const res = el.querySelector('.to-res');
+    if (output) res.textContent = output;
+    // сворачиваем длинный вывод; клик — развернуть
+    if (res.scrollHeight > 90) {
+      el.classList.add('to-folded');
+      el.addEventListener('click', () => el.classList.toggle('to-folded'));
+      el.title = 'клик — развернуть/свернуть';
+    }
+    toolOuts.delete(id);
+    scroll();
+  }
+
+  function chipStart(id, name) {
+    const el = document.createElement('div');
+    el.className = 'chip running';
+    el.innerHTML = '<div class="row"><span class="dot"></span><b></b><span class="arg"></span><span class="time"></span>' +
+      '<svg class="chev" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3.5 5 6.5l3-3"/></svg></div>' +
+      '<div class="full-wrap"><div class="full"><div class="full-in"></div></div></div>';
+    el.querySelector('b').textContent = name;
+    el.querySelector('.arg').textContent = '…';
+    const row = el.querySelector('.row');
+    row.tabIndex = 0;
+    const toggle = () => el.classList.toggle('expanded');
+    row.addEventListener('click', toggle);
+    row.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+    tools.appendChild(el);
+    const t0 = performance.now(), timeEl = el.querySelector('.time');
+    const tick = setInterval(() => timeEl.textContent = ((performance.now() - t0) / 1000).toFixed(1) + 'с', 100);
+    liveChips.set(id, { el, tick, arg: '' });
+    toolOutStart(id, name);
+    const all = [...tools.children].filter(c => !c.classList.contains('leaving') && !c.classList.contains('expanded'));
+    if (all.length > 3) { const old = all[0]; old.classList.add('leaving'); setTimeout(() => old.remove(), 380); }
+    scroll();
+  }
+  function chipArg(id, arg) {
+    const c = liveChips.get(id);
+    if (!c) return;
+    c.arg = arg;
+    c.el.querySelector('.arg').textContent = arg;
+    toolOutArg(id, arg);
+  }
+  function chipEnd(id, status, output) {
+    const c = liveChips.get(id);
+    if (!c) return;
+    clearInterval(c.tick);
+    c.el.classList.remove('running');
+    c.el.classList.add(status === 'error' ? 'error' : 'done');
+    if (output) c.el.querySelector('.full-in').textContent =
+      (c.arg ? '$ ' + c.arg + '\n\n' : '') + output;
+    liveChips.delete(id);
+    toolOutEnd(id, status, output);
+  }
+
+  function toolOutBlock(name, arg, output, ms, status) {
+    // статичный блок команды для истории (с временем исполнения)
+    const el = block('div', 'toolout ' + (status === 'error' ? 'to-error' : 'to-done'));
+    el.innerHTML = '<div class="to-head"></div><pre class="to-cmd"></pre><pre class="to-res"></pre>';
+    el.querySelector('.to-head').textContent =
+      '❯ ' + name + (ms ? ' · ' + (ms / 1000).toFixed(1) + 'с' : '');
+    el.querySelector('.to-cmd').textContent = arg ? '$ ' + arg : '';
+    const res = el.querySelector('.to-res');
+    if (output) res.textContent = output;
+    if (res.scrollHeight > 90) {
+      el.classList.add('to-folded');
+      el.addEventListener('click', () => el.classList.toggle('to-folded'));
+    }
+    scroll();
+  }
+
+  window.__ev = function (jsonStr) {
+    let e = jsonStr; if (typeof e === 'string') { try { e = JSON.parse(e); } catch { return; } }
+    if (!e || typeof e !== 'object') return;
+    switch (e.ev) {
+      case 'busy':
+        if (e.on) { aborted = false; queue = Promise.resolve(); setBusy(true); }
+        else enqueue(() => setBusy(false));
+        break;
+      case 'you':     enqueue(() => { const p = block('div', 'you'); renderMarkdown(p, e.text); scroll(); }); break;
+      case 'think':   enqueue(() => think(e.text)); break;
+      case 'para':    enqueue(() => paragraph(e.text)); break;
+      case 'code':    enqueue(() => codeBlock(e.text)); break;
+      case 'tool':    enqueue(() => tool(e.name, e.arg, e.ms || 0, e.full, e.status || 'done')); break;
+      case 'note':    note(e.name, e.arg); break;
+      case 'reset':   aborted = busy; resetOutput(e.title); [...document.querySelectorAll('#queue .chip')].forEach(c => c.remove()); syncQueue(); if (busy) aborted = true; break;
+      case 'meta':    cur.agent = e.agent; cur.model = e.model; window.__ctxLimit = e.ctx || window.__ctxLimit; updateMeta(); break;
+      case 'error':   enqueue(() => paragraph('⚠ ' + e.text)); break;
+      case 'welcome': enqueue(() => paragraph(e.text)); break;
+      case 'status':  enqueue(() => paragraph('⋯ ' + e.text)); break;
+      case 'think_start': thinkStart(); break;
+      case 'compact_start': compactStart(); break;
+      case 'compact_delta': compactDelta(e.text || ''); break;
+      case 'compact_end':   compactEnd(); break;
+      case 'think_delta': thinkDelta(e.text); break;
+      case 'think_end':   thinkEnd(); break;
+      case 'answer_start': answerStart(); break;
+      case 'answer_delta': answerDelta(e.text); break;
+      case 'answer_end':   answerEnd(); break;
+      case 'tool_start': chipStart(e.id, e.name); break;
+      case 'tool_args':  chipArg(e.id, e.arg); break;
+      case 'tool_end':   chipEnd(e.id, e.status, e.output); break;
+      case 'queued_add':     chipQueuedAdd(e.id, e.text); break;
+      case 'usage': {
+        const u = document.getElementById('usage');
+        const n = e.total;
+        const k = n >= 1e6 ? (n / 1e6).toFixed(2) + 'M'
+                : n >= 1000 ? (n / 1000).toFixed(1) + 'K' : '' + n;
+        const ctx = e.ctx || window.__ctxLimit;
+        u.textContent = ctx ? `${k} (${Math.min(100, Math.round(e.total / ctx * 100))}%)` : `${k}`;
+        buildScan();
+        break;
+      }
+      case 'queued_deliver': chipFlyToOut(e.id, e.text); break;
+      case 'queued_drop':    chipQueuedDrop(findQueued(e.id)); break;
+      case 'queued_clear':   [...queueEl.querySelectorAll('.chip')].forEach(chipQueuedDrop); break;
+      case 'history': {
+        out.innerHTML = ''; tools.innerHTML = '';
+        (e.items || []).forEach(it => {
+          if (it.ev === 'you') { const p = block('div', 'you'); renderMarkdown(p, it.text); }
+          else if (it.ev === 'md') {
+            const div = block('div', 'answer-p');
+            renderMarkdown(div, it.text);
+          }
+          else if (it.ev === 'code') codeInstant(it.text);
+          else if (it.ev === 'think') thinkInstant(it.text, it.ms);
+          else if (it.ev === 'compact') compactInstant(it.text);
+          else if (it.ev === 'tool') toolOutBlock(it.name, it.arg, it.full, it.ms, it.status);
+        });
+        followBottom();
+        break;
+      }
+    }
+  };
+
+  /* ── input ── */
+  const hist = []; let hi = 0;
+  function submit() {
+    const v = ta.value.trim();
+    if (busy && !v) { py && py.stop(); aborted = true; return; }
+    if (!v) return;
+    hist.push(v); hi = hist.length;
+    ta.value = ''; ta.style.height = 'auto';
+    followBottom();   // новое сообщение — возвращаемся к живому низу
+    py && py.submit(v);
+    if (!busy) { setBusy(true); aborted = false; queue = Promise.resolve(); }
+    else syncSend();   // занято: сообщение уходит в очередь, ход не прерываем
+  }
+  send.onclick = submit;
+
+  function lineBounds(v, i) {
+    const s = v.lastIndexOf('\n', i - 1) + 1;
+    let e = v.indexOf('\n', i); if (e === -1) e = v.length;
+    return [s, e];
+  }
+  ta.addEventListener('keydown', e => {
+    if (e.ctrlKey && !e.altKey && !e.metaKey) {
+      const k = e.key.toLowerCase();
+      const v = ta.value, i = ta.selectionStart, j = ta.selectionEnd;
+      const [ls, le] = lineBounds(v, i);
+      if (k === 'a') { e.preventDefault(); ta.setSelectionRange(ls, ls); }
+      else if (k === 'e') { e.preventDefault(); ta.setSelectionRange(le, le); }
+      else if (k === 'b') { e.preventDefault(); ta.setSelectionRange(Math.max(0, i - 1), Math.max(0, i - 1)); }
+      else if (k === 'f') { e.preventDefault(); ta.setSelectionRange(Math.min(v.length, i + 1), Math.min(v.length, i + 1)); }
+      else if (k === 'w') { e.preventDefault();
+        const before = v.slice(ls, i); const m = before.match(/[\w/.\-]*\s*$/);
+        const cut = m ? m[0].length : 0; ta.setRangeText('', i - cut, i, 'end');
+      }
+      else if (k === 'u') { e.preventDefault(); ta.setRangeText('', ls, i, 'end'); }
+      else if (k === 'k') { e.preventDefault(); ta.setRangeText('', i, le, 'end'); }
+      else if (k === 'j') { e.preventDefault(); ta.setRangeText('\n', i, j, 'end'); autoGrow(); }
+      else if (k === 'c') {
+        if (i !== j) return;
+        e.preventDefault();
+        if (v) { ta.value = ''; autoGrow(); }
+        else { py && py.hide(); }
+      }
+      return;
+    }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
+    else if (e.key === 'ArrowUp' && ta.selectionStart === 0 && hi > 0) {
+      e.preventDefault(); hi--; ta.value = hist[hi] || ''; ta.setSelectionRange(ta.value.length, ta.value.length); autoGrow();
+    }
+    else if (e.key === 'ArrowDown' && ta.selectionEnd === ta.value.length && hi < hist.length) {
+      e.preventDefault(); hi++; ta.value = hist[hi] || ''; ta.setSelectionRange(ta.value.length, ta.value.length); autoGrow();
+    }
+  });
+  function autoGrow() {
+    ta.style.height = 'auto';
+    ta.style.height = Math.min(ta.scrollHeight, 120) + 'px';
+    syncSend();
+  }
+  ta.addEventListener('input', autoGrow);
+
+  /* ── palette (Ctrl+P) ── */
+  const pal = $('pal'), palq = $('palq'), pall = $('pall'), palBack = $('palBack');
+  const cur = { session: 'Новая сессия', model: '…', agent: 'build' };
+  let palOpen = false, level = 'root', active = 0, shown = [], listCache = [];
+
+  function updateMeta() { $('metaAgent').textContent = cur.agent; $('metaModel').textContent = cur.model; buildScan(); }
+  function note(name, arg) {
+    const el = document.createElement('div');
+    el.className = 'chip done';
+    el.innerHTML = '<div class="row"><span class="dot"></span><b></b><span class="arg"></span></div>';
+    el.querySelector('b').textContent = name;
+    el.querySelector('.arg').textContent = arg;
+    tools.appendChild(el);
+    setTimeout(() => { el.classList.add('leaving'); setTimeout(() => el.remove(), 380); }, 2600);
+  }
+  function resetOutput(title) {
+    out.innerHTML = ''; tools.innerHTML = '';
+    const p = document.createElement('p'); p.className = 'you'; p.textContent = title;
+    out.appendChild(p);
+  }
+  function listFor(l, cb) {
+    if (!py) return cb([]);
+    py.palette(l, res => { try { cb(typeof res === 'string' ? JSON.parse(res) : res); } catch { cb([]); } });
+  }
+  function render() {
+    const ql = palq.value.trim().toLowerCase();
+    shown = listCache.filter(i => !ql || i.t.toLowerCase().includes(ql));
+    pall.innerHTML = '';
+    if (!shown.length) {
+      const li = document.createElement('li'); li.className = 'pal-empty'; li.textContent = 'Ничего не найдено';
+      pall.appendChild(li); return;
+    }
+    active = Math.max(0, Math.min(active, shown.length - 1));
+    let lastG;
+    shown.forEach((it, idx) => {
+      if (it.g && it.g !== lastG) {
+        const h = document.createElement('li'); h.className = 'pal-group'; h.textContent = it.g;
+        pall.appendChild(h); lastG = it.g;
+      }
+      const li = document.createElement('li');
+      li.className = 'pal-item' + (idx === active ? ' active' : '');
+      li.innerHTML = '<span class="t"></span><span class="d"></span>';
+      li.querySelector('.t').textContent = it.t;
+      const d = li.querySelector('.d');
+      if (it.on) { d.className = 'd on'; d.textContent = '✓'; }
+      else if (it.go) d.textContent = (it.d ? it.d + '  ' : '') + '›';
+      else d.textContent = it.d || '';
+      li.addEventListener('mousemove', () => { if (active !== idx) { active = idx; mark(); } });
+      li.addEventListener('click', choose);
+      pall.appendChild(li);
+    });
+    mark(true);
+  }
+  function mark(scrollTo) {
+    [...pall.querySelectorAll('.pal-item')].forEach((el, i) => {
+      el.classList.toggle('active', i === active);
+      if (scrollTo && i === active) el.scrollIntoView({ block: 'nearest' });
+    });
+  }
+  function move(d) { if (!shown.length) return; active = (active + d + shown.length) % shown.length; mark(true); }
+  function goLevel(l) {
+    level = l; palq.value = '';
+    palq.placeholder = { root: 'Команды', sessions: 'Сессии', models: 'Модели', agents: 'Агенты' }[l];
+    pal.classList.toggle('sub', l !== 'root');
+    listFor(l, items => { listCache = items; active = Math.max(0, items.findIndex(i => i.on)); render(); });
+  }
+  function choose() {
+    const it = shown[active];
+    if (!it) return;
+    if (it.go) { goLevel(it.go); palq.focus(); }
+    else { closePalette(); py && py.action(it.act, it.val || ''); }
+  }
+  function openPalette(l = 'root') {
+    const wasOpen = palOpen;
+    palOpen = true;
+    goLevel(l);
+    pal.classList.add('open');
+    setTimeout(() => palOpen && palq.focus({ preventScroll: true }), wasOpen ? 30 : 220);
+  }
+  function closePalette() {
+    palOpen = false;
+    pal.classList.remove('open');
+    if (isOpen) ta.focus({ preventScroll: true });
+  }
+  pall.addEventListener('mousedown', e => e.preventDefault());
+  palBack.addEventListener('click', () => { goLevel('root'); palq.focus(); });
+  palq.addEventListener('input', () => { if (renameMode) return; active = 0; render(); });
+  palq.addEventListener('keydown', e => {
+    e.stopPropagation();
+    if (e.key === 'ArrowDown') { e.preventDefault(); move(1); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); move(-1); }
+    else if (e.key === 'Enter' && renameMode) {
+      e.preventDefault();
+      const nv = palq.value.trim();
+      if (nv && py) py.action('rename_session', JSON.stringify([renameMode, nv]));
+      renameMode = null;
+      palq.placeholder = 'Сессии';
+      palq.value = '';
+      setTimeout(() => goLevel('sessions'), 300);
+    }
+    else if (e.key === 'Escape' && renameMode) {
+      e.preventDefault();
+      renameMode = null;
+      palq.placeholder = 'Сессии';
+      palq.value = '';
+      goLevel('sessions');
+    }
+    else if (e.key === 'Enter') { e.preventDefault(); choose(); }
+    else if (e.key === 'Escape') { e.preventDefault(); level === 'root' ? closePalette() : goLevel('root'); }
+    else if (e.key === 'Backspace' && !palq.value && level !== 'root') { e.preventDefault(); goLevel('root'); }
+    else if (e.ctrlKey && e.code === 'KeyP') { e.preventDefault(); closePalette(); }
+    else if (e.ctrlKey && e.code === 'KeyF' && level === 'sessions' && !renameMode) {
+      e.preventDefault();
+      const it = shown[active];
+      if (it && it.sid && py) { py.action('pin', it.sid); setTimeout(() => goLevel('sessions'), 250); }
+    }
+    else if (e.ctrlKey && e.code === 'KeyR' && level === 'sessions' && !renameMode) {
+      e.preventDefault();
+      const it = shown[active];
+      if (it && it.sid) {
+        renameMode = it.sid;
+        palq.value = it.t.replace(/^📌 /, '');
+        palq.placeholder = 'Enter — переименовать · Esc — отмена';
+        palq.select();
+      }
+    }
+    else if (e.key === 'Delete' && level === 'sessions' && !renameMode) {
+      e.preventDefault();
+      const it = shown[active];
+      if (!it || !it.sid || !py) return;
+      const li = pall.querySelectorAll('.pal-item')[active];
+      if (delArm === it.sid) {                 // второе нажатие — удаляем
+        delArm = null;
+        py.action('del_session', it.sid);
+        setTimeout(() => goLevel('sessions'), 300);
+      } else {                                 // первое — предупреждение
+        delArm = it.sid;
+        if (li) { const d = li.querySelector('.d'); if (d) { d.textContent = 'ещё Del — удалить'; d.style.color = 'var(--err)'; } }
+        setTimeout(() => { delArm = null; if (pall.contains(li)) goLevel('sessions'); }, 2500);
+      }
+    }
+  });
+  let delArm = null, renameMode = null;
+  ta.addEventListener('focus', () => { if (palOpen) closePalette(); });
+  $('meta').addEventListener('click', () => (palOpen ? closePalette() : openPalette()));
+  addEventListener('keydown', e => {
+    if (e.ctrlKey && !e.altKey && !e.metaKey && e.code === 'KeyP') {
+      e.preventDefault(); palOpen ? closePalette() : openPalette();
+    }
+  });
+
+  /* ── show / hide: панели вырастают из орба (позицию орба передаёт Python) ── */
+  let isOpen = false, firstOpen = true;
+
+  function aimAtOrb() {}
+  function setOpen(v) {
+    if (v === isOpen) return;
+    isOpen = v;
+    aimAtOrb();
+    if (v) {
+      setTimeout(() => {
+        stack.classList.remove('closed');
+        setTimeout(() => isOpen && !palOpen && ta.focus({ preventScroll: true }), 250);
+      }, 150);
+    } else {
+      ta.blur();
+      palOpen = false; pal.classList.remove('open');
+      stack.classList.add('closed');
+      py && py.hide();   // только на реальном переходе в «закрыто»
+    }
+  }
+  window.__setOpen = function (v) { setOpen(!!v); };
+  let escArm = null;
+  addEventListener('keydown', e => {
+    if (e.key === 'Escape' && !palOpen) {
+      if (e.repeat) { e.preventDefault(); return; }   // автоповтор — не остановка
+      if (busy) {
+        // как в opencode: первый Esc — предупреждение, второй — остановка
+        if (escArm) {
+          clearTimeout(escArm); escArm = null;
+          py && py.escInterrupt();
+        } else {
+          escArm = setTimeout(() => escArm = null, 2500);
+          window.__ev(JSON.stringify({ev: 'note', name: 'Esc', arg: 'ещё Esc — остановить'}));
+        }
+      } else if (ta.value) {
+        ta.value = ''; autoGrow();
+      } else {
+        window.__setOpen(false);
+      }
+    }
+    // home/end — навигация по сессии, как в opencode
+    if (!palOpen && (e.key === 'Home' || e.key === 'End')) {
+      e.preventDefault();
+      if (e.key === 'Home') { followMode = false; out.scrollTop = 0; }
+      else followBottom();
+    }
+  });
+
+  /* ── init ── */
+  function applyTheme(t) {
+    const r = document.documentElement.style;
+    for (const [k, v] of Object.entries(t.vars || {})) r.setProperty(k, v);
+    document.documentElement.style.colorScheme = t.dark ? 'dark' : 'light';
+  }
+  window.__applyTheme = applyTheme;
+  window.__orbAt = null;
+
+  function init() {
+    window.__pyReady = true;
+    const J = v => typeof v === 'string' ? JSON.parse(v) : v;
+    py.theme(t => applyTheme(J(t)));
+    py.meta(m => { m = J(m);
+      cur.agent = m.agent; cur.model = m.model; cur.session = m.session;
+      window.__ctxLimit = m.ctx || null;
+      updateMeta();
+    });
+    if (firstOpen) {
+      firstOpen = false;
+      py.welcomed(res => { if (res === 'yes') enqueue(() => paragraph('Готов — спроси что-нибудь или поручи задачу.')); });
+    }
+    setOpen(true);
+  }
+  new QWebChannel(qt.webChannelTransport, ch => { py = ch.objects.py; init(); });
+
+  // отладочные хуки (devtools/тесты)
+  window.__debug = {
+    submit: v => { ta.value = v || ta.value; submit(); },
+    setModel: m => py && py.action('switch_model', m),
+    state: () => ({ busy, isOpen, session: cur.session })
+  };
+})();
+</script>
+</body>
+</html>

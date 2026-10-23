@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Слушатель кнопки Copilot (Meta+F23) с разделением по длительности нажатия.
+
+  короткое нажатие (< hold_ms)  -> short_cmd из конфига (или ничего)
+  длинное  нажатие (>= hold_ms) -> ~/.local/bin/oc-popup-toggle (попап opencode)
+
+Работает от root как systemd-сервис (пример юнита — systemd/copilot-key.service),
+читает /dev/input/event* напрямую и запускает тумблеры от имени пользователя
+графической сессии (runuser).
+
+Конфиг: ~/.config/oc-popup/config.json
+  user       — имя пользователя графической сессии (по умолчанию — SUDO_USER
+               или пользователь с UID 1000)
+  hold_ms    — порог длинного нажатия (мс, по умолчанию 600)
+  short_cmd  — команда короткого нажатия, например "~/.local/bin/flclash-toggle";
+               пусто или отсутствие ключа — короткое нажатие игнорируется
+"""
+
+import fcntl
+import glob
+import json
+import os
+import pwd
+import select
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+DEFAULT_HOLD_MS = 600
+
+
+def _config_path():
+    candidates = [os.environ.get("SUDO_USER")]
+    try:
+        candidates.append(pwd.getpwuid(1000).pw_name)
+    except KeyError:
+        pass
+    for name in filter(None, candidates):
+        return Path(pwd.getpwnam(name).pw_dir) / ".config/oc-popup/config.json"
+    raise SystemExit("не смог определить пользователя — задай 'user' в конфиге "
+                     "или OC_POPUP_USER")
+
+
+CONFIG = _config_path()
+
+
+def _cfg():
+    try:
+        return json.loads(CONFIG.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+USER = os.environ.get("OC_POPUP_USER") or _cfg().get("user") \
+    or os.environ.get("SUDO_USER") or pwd.getpwuid(1000).pw_name
+UID = pwd.getpwnam(USER).pw_uid
+HOME = pwd.getpwnam(USER).pw_dir
+
+SHORT_CMD = (_cfg().get("short_cmd") or "").strip()
+POPUP_TOGGLE = f"{HOME}/.local/bin/oc-popup-toggle"
+
+EV_KEY = 0x01
+KEY_F23 = 193
+META_CODES = {125, 97}  # KEY_LEFTMETA, KEY_RIGHTMETA
+
+EVENT = struct.Struct("llHHI")  # struct input_event на x86_64
+IOC_KEYBITS = 0x80000000 | (96 << 16) | (0x45 << 8) | 0x21
+IOC_GNAME = 0x80000000 | (256 << 16) | (0x45 << 8) | 0x06
+
+POLL_MS = 20
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+
+
+def hold_ms():
+    try:
+        ms = int(_cfg().get("hold_ms", DEFAULT_HOLD_MS))
+        return max(150, min(3000, ms))
+    except Exception:
+        return DEFAULT_HOLD_MS
+
+
+def has_key(fd, code):
+    try:
+        buf = fcntl.ioctl(fd, IOC_KEYBITS, b"\x00" * 96)
+    except OSError:
+        return False
+    return bool(buf[code // 8] & (1 << (code % 8)))
+
+
+def dev_name(fd, fallback):
+    try:
+        buf = fcntl.ioctl(fd, IOC_GNAME, b"\x00" * 256)
+        return buf.split(b"\x00")[0].decode(errors="replace") or fallback
+    except OSError:
+        return fallback
+
+
+def open_keyboards():
+    devs = {}
+    for path in sorted(glob.glob("/dev/input/event*")):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            continue
+        if not has_key(fd, KEY_F23):
+            os.close(fd)
+            continue
+        log(f"слушаю {path} ({dev_name(fd, path)})")
+        devs[fd] = {"path": path, "meta": False, "down": False,
+                    "t0": 0.0, "long": False}
+    return devs
+
+
+def run_as_user(target):
+    cmd = [
+        "runuser", "-u", USER, "--", "env",
+        f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{UID}/bus",
+        f"XDG_RUNTIME_DIR=/run/user/{UID}",
+        "WAYLAND_DISPLAY=wayland-0",
+        "DISPLAY=:0",
+        f"HOME={HOME}",
+        target,
+    ]
+    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def fire_vpn():
+    if not SHORT_CMD:
+        return
+    cmd = SHORT_CMD
+    if cmd.startswith("~/"):
+        cmd = HOME + cmd[1:]
+    log(f"Copilot: КОРОТКОЕ нажатие -> {cmd}")
+    run_as_user(cmd)
+
+
+def fire_popup():
+    log("Copilot: ДЛИННОЕ нажатие -> попап opencode")
+    run_as_user(POPUP_TOGGLE)
+
+
+def main():
+    devs = open_keyboards()
+    if not devs:
+        log("ОШИБКА: не нашёл клавиатуру с KEY_F23")
+        return 1
+
+    hold = hold_ms() / 1000.0
+    log(f"порог: короткое < {int(hold * 1000)} мс <= длинное")
+
+    poller = select.poll()
+    for fd in devs:
+        poller.register(fd, select.POLLIN)
+
+    while True:
+        for fd, _ev in poller.poll(POLL_MS):
+            st = devs.get(fd)
+            if st is None:
+                continue
+            while True:
+                try:
+                    data = os.read(fd, EVENT.size * 64)
+                except BlockingIOError:
+                    break
+                except OSError as e:
+                    log(f"устройство {st['path']} отвалилось: {e}")
+                    try:
+                        poller.unregister(fd)
+                    except KeyError:
+                        pass
+                    os.close(fd)
+                    devs.pop(fd, None)
+                    break
+                if not data:
+                    break
+                now = time.monotonic()
+                for off in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                    _s, _us, etype, code, value = EVENT.unpack_from(data, off)
+                    if etype != EV_KEY:
+                        continue
+                    if code in META_CODES:
+                        st["meta"] = value != 0
+                        if value == 0 and st["down"] and not st["long"]:
+                            if now - st["t0"] < hold:
+                                fire_vpn()
+                            st["down"] = False
+                    elif code == KEY_F23:
+                        if value == 1 and st["meta"] and not st["down"]:
+                            st["down"] = True
+                            st["t0"] = now
+                            st["long"] = False
+                        elif value == 0 and st["down"]:
+                            if not st["long"] and now - st["t0"] < hold:
+                                fire_vpn()
+                            st["down"] = False
+
+        # проверка «дожатия» до длинного нажатия
+        now = time.monotonic()
+        for st in devs.values():
+            if st["down"] and not st["long"] and now - st["t0"] >= hold:
+                st["long"] = True
+                fire_popup()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)

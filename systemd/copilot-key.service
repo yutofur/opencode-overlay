@@ -1,0 +1,14 @@
+[Unit]
+Description=Copilot key dispatcher (short = short_cmd, long = opencode overlay)
+After=multi-user.target
+
+# Пользователь подставляется установкой:
+#   sudo sed -i "s/__USER__/$USER/" /etc/systemd/system/copilot-key.service
+
+[Service]
+ExecStart=/usr/bin/python3 /home/__USER__/.local/bin/copilot-key-listener
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,2163 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""oc-popup — оверлей opencode поверх всех окон (WebEngine + HTML-интерфейс).
+
+Архитектура:
+  * OrbWin  — отдельное мини-окно-«сфера» (кнопка) внизу по центру экрана,
+              всегда на одном месте; клик = показать/скрыть попап;
+  * Popup   — окно с HTML-интерфейсом (стеклянные панели), позиция своя,
+              перетаскивается и запоминается независимо от орба.
+
+Интерфейс: ~/.local/share/oc-popup/index.html, связь через QWebChannel.
+Хост запускает `opencode run --format json --thinking` и стримит события
+(reasoning / tool_use / text) в страницу.
+
+Управление: unix-сокет $XDG_RUNTIME_DIR/oc-popup.sock (toggle/show/hide/ping).
+Кнопка Copilot: длинное нажатие -> copilot-key-listener -> oc-popup-toggle.
+"""
+
+import base64
+import configparser
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+from PySide6.QtCore import (QFile, QObject, QProcess, QSocketNotifier, Qt,
+                            QTimer, QUrl, QVariantAnimation, Signal, Slot,
+                            QFileSystemWatcher, QPointF, QRectF)
+from PySide6.QtGui import (QColor, QGuiApplication, QIcon, QPainter,
+                           QPainterPath, QPen, QFont)
+from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
+
+from PySide6.QtWebEngineCore import QWebEnginePage
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebChannel import QWebChannel
+from PySide6.QtDBus import QDBusConnection
+
+HOME = Path.home()
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "oc-popup"
+CONFIG_PATH = CONFIG_DIR / "oc-popup" / "config.json"
+STATE_PATH = STATE_DIR / "state.json"
+KDE_GLOBALS = CONFIG_DIR / "kdeglobals"
+INDEX_HTML = HOME / ".local/share/oc-popup/index.html"
+_EVLOG = bool(os.environ.get("OC_POPUP_EVLOG"))
+LOG_PATH = STATE_DIR / "host.log"
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+SOCK_PATH = RUNTIME_DIR / "oc-popup.sock"
+SOCK_WEB = RUNTIME_DIR / "oc-popup-web.sock"
+ICON_PATH = HOME / ".local/share/icons/hicolor/512x512/apps/oc-popup.png"
+MODELS_CTX_CACHE = HOME / ".local/share/oc-popup/models-context.json"
+KWIN_SCRIPT_BASE = RUNTIME_DIR / "oc-popup-kwin"
+SERVICE_JSON = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "opencode" / "service.json"
+QDBUS = shutil.which("qdbus-qt6") or shutil.which("qdbus") or ""
+
+
+class OpencodeServer:
+    """Клиент фонового сервиса opencode (service.json + Basic auth) с SSE."""
+
+    def __init__(self):
+        self.url = None
+        self.auth = None
+
+    def ensure(self):
+        if self.url:
+            return True
+        if not self._load():
+            return False
+        try:
+            self.get("/api/info")
+            return True
+        except Exception:
+            # сервис мог перезапуститься — перечитываем и пробуем ещё раз
+            self.url = None
+            if not self._load():
+                return False
+            try:
+                self.get("/api/info")
+                return True
+            except Exception:
+                return False
+
+    def _load(self):
+        for _ in range(2):
+            try:
+                d = json.loads(SERVICE_JSON.read_text())
+                self.url = d["url"].rstrip("/")
+                tok = base64.b64encode(f"opencode:{d['password']}".encode()).decode()
+                self.auth = f"Basic {tok}"
+                return True
+            except Exception:
+                try:  # поднять сервис
+                    subprocess.run([opencode_bin({}), "service", "status"],
+                                   capture_output=True, timeout=30)
+                except Exception:
+                    pass
+                time.sleep(1)
+        return False
+
+    def req(self, method, path, body=None):
+        data = json.dumps(body).encode() if body is not None else None
+        r = urllib.request.Request(self.url + path, data=data, method=method)
+        r.add_header("Authorization", self.auth)
+        if data:
+            r.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(r, timeout=30) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
+
+    def get(self, path):
+        return self.req("GET", path)
+
+    def post(self, path, body=None):
+        return self.req("POST", path, body or {})
+
+    def sse(self, on_event, stop_flag, timeout_s=600, deadline=None):
+        """Читает /api/event; on_event(dict) на каждое событие.
+        deadline — wall-clock: после него выходим (страховка от вечных ретраев)."""
+        r = urllib.request.Request(self.url + "/api/event")
+        r.add_header("Authorization", self.auth)
+        r.add_header("Accept", "text/event-stream")
+        resp = urllib.request.urlopen(r, timeout=timeout_s)
+        if stop_flag.get("close") is not None:
+            stop_flag["close"](resp)
+        buf = b""
+        try:
+            while not stop_flag.get("stop"):
+                if deadline is not None and time.time() > deadline:
+                    break
+                # read1: отдаёт что уже пришло; read(4096) копит буфер и
+                # отдаёт пачками раз в пару секунд — стрим выглядит мёртвым
+                chunk = resp.read1(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if line.startswith(b"data: "):
+                        try:
+                            on_event(json.loads(line[6:]))
+                        except Exception:
+                            pass
+        except Exception:
+            pass  # соединение закрыли из finish() — это штатный выход
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+
+_KWIN_LOCK = threading.Lock()
+
+TELEMETRY_BUS = "org.ocpopup.Telemetry"
+TELEMETRY_PATH = "/telemetry"
+
+
+class KWinTelemetry(QObject):
+    """Экспортируемый на сессионной шине объект: KWin-скрипт после применения
+    геометрии шлёт сюда РЕАЛЬНОЕ положение окон. На Wayland клиент своих
+    координат не знает — это единственный способ узнать, куда окно поставил
+    композитор. Числа передаются строками, чтобы не зависеть от int/double
+    marshalling. PySide6 не умеет Q_CLASSINFO, поэтому интерфейс задаётся
+    явным registerObject(path, interface, obj, ExportAllSlots)."""
+
+    def __init__(self, on_report):
+        super().__init__()
+        self._on_report = on_report
+
+    @Slot(str, str, str, str, str)
+    def report(self, title, x, y, w, h):
+        try:
+            self._on_report(title, int(x), int(y), int(w), int(h))
+        except Exception as e:
+            log(f"telemetry report: {e}")
+
+
+def kwin_apply(rules, tag="cfg"):
+    """Нативный Wayland: xdg-shell не даёт клиенту ни keep-above, ни позицию —
+    применяем их через KWin Scripting API (org.kde.KWin /Scripting).
+
+    Скрипт печатает реальные координаты до/после (print → journald kwin_wayland) —
+    на Wayland это единственный источник правды о позиции окна: клиент своих
+    координат не знает. Вызовы сериализованы локом: retry-и идут чаще, чем
+    длится qdbus-тройка, без лока pass'ы терялись бы (unload чужого load'а)."""
+    if not QDBUS:
+        log("kwin_apply: qdbus-qt6 не найден")
+        return False
+    body = "var __n = 0;\n"
+    for r in rules:
+        focus = "false" if r.get("nofocus") else "true"
+        geom = ""
+        if "x" in r:
+            # ВАЖНО: присваивать можно только object literal — мутация копии
+            # QRect (`var g = w.frameGeometry; g.x=...; w.frameGeometry = g`)
+            # в QJS-песочнице KWin тихо НЕ работает (проверено телеметрией:
+            # позиция не менялась). С literal-объектом KWin двигает окно.
+            geom = (f'var g = w.frameGeometry;\n'
+                    f'    print("oc-popup kwin: [{r["title"]}] before " + g.x + "," + g.y'
+                    f' + " " + g.width + "x" + g.height);\n'
+                    f'    w.frameGeometry = {{ x: {r["x"]}, y: {r["y"]},'
+                    f' width: {r["w"]}, height: {r["h"]} }};\n'
+                    f'    print("oc-popup kwin: [{r["title"]}] after " + w.frameGeometry.x'
+                    f' + "," + w.frameGeometry.y + " " + w.frameGeometry.width + "x" + w.frameGeometry.height);\n'
+                    f'    callDBus("{TELEMETRY_BUS}", "{TELEMETRY_PATH}", "{TELEMETRY_BUS}",'
+                    f' "report", "{r["title"]}", "" + w.frameGeometry.x, "" + w.frameGeometry.y,'
+                    f' "" + w.frameGeometry.width, "" + w.frameGeometry.height);')
+        body += (
+            f'for (const w of workspace.windowList()) {{\n'
+            f'  if (w.caption == "{r["title"]}") {{\n'
+            f'    __n++;\n'
+            f'    w.noBorder = true; w.keepAbove = true;\n'
+            f'    w.skipTaskbar = true; w.skipSwitcher = true;\n'
+            f'    w.focusable = {focus};\n'
+            f'    {geom}\n'
+            f'  }}\n'
+            f'}}\n'
+        )
+    body += 'print("oc-popup kwin: pass matched=" + __n);\n'
+    try:
+        with _KWIN_LOCK:
+            script_path = KWIN_SCRIPT_BASE.with_name(f"oc-popup-kwin-{tag}.js")
+            script_path.write_text(body, encoding="utf-8")
+            env = dict(os.environ)
+            subprocess.run([QDBUS, "org.kde.KWin", "/Scripting",
+                            "org.kde.kwin.Scripting.unloadScript", f"oc-popup-{tag}"],
+                           capture_output=True, env=env, timeout=5)
+            r = subprocess.run([QDBUS, "org.kde.KWin", "/Scripting",
+                                "org.kde.kwin.Scripting.loadScript",
+                                str(script_path), f"oc-popup-{tag}"],
+                               capture_output=True, env=env, timeout=5, text=True)
+            started = subprocess.run([QDBUS, "org.kde.KWin", "/Scripting",
+                                      "org.kde.kwin.Scripting.start"],
+                                     capture_output=True, env=env, timeout=5, text=True)
+            if r.returncode != 0 or started.returncode != 0:
+                log(f"kwin_apply: load rc={r.returncode} {r.stderr.strip()[:120]}"
+                    f" | start rc={started.returncode} {started.stderr.strip()[:120]}")
+                return False
+        return True
+    except Exception as e:
+        log(f"kwin_apply: {e}")
+        return False
+
+DEFAULTS = {
+    "width": 608,            # окно попапа (стек 560 + поля 24*2)
+    "height": 820,
+    "dock_h": 54,            # высота дока снизу (1200-1146 по скрину)
+    "orb_gap": 14,           # зазор звезды над доком
+    "orb_bottom": 14,
+    "hold_ms": 600,          # порог длинного нажатия Copilot
+    "timeout_s": 300,
+    "opencode": "",
+}
+
+
+def log(msg):
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+    except Exception:
+        pass
+    return cfg
+
+
+def load_state():
+    try:
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_state(st):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, STATE_PATH)
+
+
+def opencode_bin(cfg):
+    explicit = (cfg.get("opencode") or "").strip()
+    if explicit and Path(explicit).exists():
+        return explicit
+    found = shutil.which("opencode")
+    if found:
+        return found
+    for cand in (HOME / ".opencode/bin/opencode", HOME / ".local/bin/opencode"):
+        if cand.exists():
+            return str(cand)
+    return "opencode"
+
+
+# ------------------------------------------------------------------ тема KDE
+
+class Theme:
+    def __init__(self, path: Path):
+        self.path = path
+        self.reload()
+
+    @staticmethod
+    def _color(raw):
+        if not raw:
+            return None
+        try:
+            parts = [int(x) for x in raw.replace(" ", "").split(",")[:3]]
+        except ValueError:
+            return None
+        return parts if len(parts) == 3 else None
+
+    def reload(self):
+        cp = configparser.ConfigParser(strict=False, interpolation=None)
+        cp.optionxform = str
+        try:
+            cp.read(self.path, encoding="utf-8")
+        except Exception:
+            pass
+
+        def rgb(section, key, fallback):
+            try:
+                raw = cp.get(section, key, fallback=None)
+            except Exception:
+                raw = None
+            p = self._color(raw)
+            return p if p else fallback
+
+        self.bg = rgb("Colors:Window", "BackgroundNormal", (252, 252, 252))
+        self.fg = rgb("Colors:Window", "ForegroundNormal", (35, 38, 41))
+        self.accent = rgb("Colors:Button", "DecorationFocus",
+                          rgb("Colors:Selection", "BackgroundNormal", (61, 174, 233)))
+
+        def lum(c):
+            def ch(v):
+                v = v / 255
+                return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+            r, g, b = map(ch, c)
+            return 0.2126 * r + 0.7152 * g + 0.0722 * b
+        self.is_dark = lum(self.bg) < 0.35
+
+    def vars(self):
+        bg, fg = self.bg, self.fg
+        dark = self.is_dark
+
+        def r(c, a):
+            return f"rgba({c[0]},{c[1]},{c[2]},{round(a / 255, 2)})"
+
+        return {
+            "--glass": r(bg, 205 if not dark else 188),
+            "--glass-strong": r(bg, 238 if not dark else 212),
+            "--chip": r(bg, 215 if not dark else 205),
+            "--code": r(fg, 18 if not dark else 26),
+            "--edge": r(fg, 23 if not dark else 32),
+            "--edge-hi": "rgba(255,255,255,0.55)" if not dark else "rgba(255,255,255,0.10)",
+            "--text": f"rgb({fg[0]},{fg[1]},{fg[2]})",
+            "--text-dim": r(fg, 150 if not dark else 160),
+            "--run": f"rgb({self.accent[0]},{self.accent[1]},{self.accent[2]})",
+            "--ok": "#1f9d63" if not dark else "#4cc58b",
+            "--err": "#d6403a" if not dark else "#ff7a73",
+            "--shadow": ("0 4px 14px rgba(20,30,60,0.16)"
+                         if not dark else "0 4px 14px rgba(0,0,0,0.35)"),
+        }
+
+
+# ------------------------------------------------------------ markdown/tools
+
+def split_markdown(md: str):
+    segs = []
+    try:
+        parts = re.split(r"```[A-Za-z0-9_+\-]*[ \t]*\n?(.*?)```", md, flags=re.S)
+    except re.error:
+        parts = [md]
+    for idx, chunk in enumerate(parts):
+        if idx % 2 == 1:
+            code = chunk.strip("\n")
+            if code.strip():
+                segs.append(("code", code))
+        else:
+            for para in re.split(r"\n\s*\n", chunk.strip()):
+                if para.strip():
+                    segs.append(("para", para.strip()))
+    return segs
+
+
+def tool_info(part):
+    state = part.get("state") or {}
+    inp = state.get("input") or {}
+    if isinstance(inp, str):
+        inp = {}
+    # имя: SSE-события — "tool", экспорт — "name"
+    name = part.get("tool") or part.get("name") or state.get("title") or "tool"
+    arg = (inp.get("command") or inp.get("pattern") or inp.get("path") or
+           inp.get("url") or inp.get("query") or inp.get("filePath") or
+           next((str(v) for v in inp.values() if isinstance(v, str)), name))
+    # время: SSE — {start,end}, экспорт — {created,completed}
+    t = part.get("time") or state.get("time") or {}
+    try:
+        b = t.get("start", t.get("created", 0))
+        e = t.get("end", t.get("completed", 0))
+        ms = max(250, int(e - b))
+    except Exception:
+        ms = 400
+    full = None
+    if inp:
+        full = "$ " + json.dumps(inp, ensure_ascii=False)
+    outp = state.get("output")
+    if not outp and isinstance(state.get("content"), list):
+        outp = "\n".join(c.get("text", "") for c in state["content"]
+                         if isinstance(c, dict) and c.get("type") == "text")
+    if isinstance(outp, str) and outp.strip():
+        full = (full + "\n" if full else "") + outp.strip()[:800]
+    status = "done" if state.get("status") in (None, "completed", "success") else "error"
+    return name, (arg or "")[:120], min(ms, 4000), full, status
+
+
+# -------------------------------------------------------------------- бекенд
+
+class Backend(QObject):
+    event = Signal(str)
+
+    def __init__(self, cfg, state):
+        super().__init__()
+        self.cfg = cfg
+        self.state = state
+        self.kde = Theme(KDE_GLOBALS)
+        self.server = OpencodeServer()
+        self._stop_flag = {"stop": False}
+        self.err_buf = ""
+        self.answer_parts = 0
+        self.busy = False
+        self.session_id = state.get("session") or ""
+        self.session_title = state.get("session_title") or ""
+        self.model = state.get("model") or ""
+        self._model_manual = bool(state.get("model_manual"))
+        log(f"backend: session={(self.session_id or '-')[-8:]} "
+            f"model={self.model or '-'} manual={self._model_manual}")
+        self.agent = state.get("agent") or cfg.get("agent") or "build"
+        self.models_cache = []
+        self.sessions_cache = []
+        self.commands_cache = []
+        self.ctx_limits = self._load_context_limits()
+        self._hide_cb = None
+        self._drag_cb = None
+        self._native_drag_cb = None
+        self._queue_cb = None
+        # очередь сообщений: то, что ушло в занятую сессию и ждёт своего хода
+        self._qitems = []
+        self._qseq = 0
+        self._queued = 0
+        self._qlock = threading.Lock()
+        self._first_cache_done = False
+        self._manual_session = False
+        self._agents = None
+        threading.Thread(target=self._refresh_caches, daemon=True).start()
+
+    def model_ref(self):
+        """'provider/id#variant' → Model.Ref для API (строку modelID API игнорирует!)."""
+        if not self.model:
+            return None
+        pid, _, mid = self.model.partition("/")
+        vid = ""
+        if "#" in mid:
+            mid, _, vid = mid.partition("#")
+        ref = {"id": mid, "providerID": pid}
+        if vid:
+            ref["variant"] = vid
+        return ref
+
+    def _new_session_body(self):
+        body = {"title": "opencode popup", "directory": str(HOME)}
+        if self.agent:
+            body["agent"] = self.agent
+        ref = self.model_ref()
+        if ref:
+            body["model"] = ref
+        return body
+
+    def emit_ev(self, obj):
+        self.event.emit(json.dumps(obj, ensure_ascii=False))
+
+    def short_model(self):
+        s = self.model.split("/")[-1] if self.model else "auto"
+        return s.split("#")[0]
+
+    def meta_obj(self):
+        return {"agent": self.agent, "model": self.short_model(),
+                "session": self.session_title or "Новая сессия",
+                "ctx": self.context_limit()}
+
+    def _load_context_limits(self):
+        """Кэш контекстных окон моделей (источник — models.dev, как у opencode)."""
+        limits = {}
+        try:
+            limits = json.loads(MODELS_CTX_CACHE.read_text())
+        except Exception:
+            def fetch():
+                try:
+                    import urllib.request
+                    req = urllib.request.Request(
+                        "https://models.dev/api.json",
+                        headers={"User-Agent": "oc-popup/1.0"})
+                    raw = urllib.request.urlopen(req, timeout=25).read()
+                    d = json.loads(raw)
+                    out = {}
+                    for pid, p in d.items():
+                        for mid, m in (p.get("models") or {}).items():
+                            ctx = (m.get("limit") or {}).get("context") \
+                                or m.get("context_window")
+                            if ctx:
+                                out[f"{pid}/{mid}"] = int(ctx)
+                    MODELS_CTX_CACHE.write_text(json.dumps(out))
+                    self.ctx_limits = out
+                    log(f"context-кэш: {len(out)} моделей")
+                    # догоняем страницу: мета ушла до загрузки лимитов
+                    self.emit_ev({"ev": "meta", **self.meta_obj()})
+                except Exception as e:
+                    log(f"models.dev: {e}")
+            threading.Thread(target=fetch, daemon=True).start()
+        return limits
+
+    def context_limit(self):
+        if not self.model:
+            return None
+        try:
+            return self.ctx_limits.get(self.model) or \
+                self.ctx_limits.get(self.model.split("#")[0])
+        except Exception:
+            return None
+
+    def _refresh_caches(self):
+        binp = opencode_bin(self.cfg)
+        try:
+            r = subprocess.run([binp, "models"], capture_output=True, text=True, timeout=60)
+            self.models_cache = [l.strip() for l in r.stdout.splitlines() if "/" in l.strip()]
+        except Exception as e:
+            log(f"models: {e}")
+        try:
+            r = subprocess.run([binp, "session", "list", "--format", "json", "-n", "60"],
+                               capture_output=True, text=True, timeout=60, cwd=str(HOME))
+            data = json.loads(r.stdout or "[]")
+            self.sessions_cache = data if isinstance(data, list) else []
+        except Exception as e:
+            log(f"sessions: {e}")
+        # команды сервера (init, review, …) + модель открытой сессии
+        try:
+            if self.server.ensure():
+                r = self.server.get("/api/command") or {}
+                self.commands_cache = r.get("data") or []
+                r = self.server.get("/api/session") or {}
+                for s in (r.get("data") or []):
+                    if s.get("id") != self.session_id:
+                        continue
+                    m = s.get("model") or {}
+                    if m.get("id") and m.get("providerID") and not self._model_manual:
+                        mm = f"{m['providerID']}/{m['id']}"
+                        if m.get("variant"):
+                            mm += f"#{m['variant']}"
+                        if mm != self.model:
+                            self.model = mm
+                            self.emit_ev({"ev": "meta", **self.meta_obj()})
+                    break
+        except Exception as e:
+            log(f"commands/model: {e}")
+        if not self._first_cache_done:
+            self._first_cache_done = True
+            if os.environ.get("OC_POPUP_NO_AUTOPICK") and self.session_id:
+                # отладочный режим: грузим историю сохранённой сессии
+                self._emit_history(self.session_id)
+                threading.Timer(2.5, self.resume).start()
+            else:
+                self._auto_pick_last()
+
+    def _auto_pick_last(self):
+        """При активации попапа открываем последнюю (новейшую) сессию с историей."""
+        if self.busy or self._manual_session:
+            return
+        if os.environ.get("OC_POPUP_NO_AUTOPICK"):
+            return  # отладочный режим: держимся сохранённой сессии
+        newest = self.sessions_cache[0] if self.sessions_cache else None
+        if not newest:
+            return
+        sid = newest.get("id", "")
+        if not sid:
+            return
+        self.session_id = sid
+        self.session_title = newest.get("title") or ""
+        self.emit_ev({"ev": "meta", **self.meta_obj()})
+        self._persist()
+        self._emit_history(sid)
+        # сессия прямо сейчас работает — подхватим состояние и стрим
+        threading.Timer(2.5, self.resume).start()
+
+    def fetch_history(self, sid, max_messages=None):
+        """История сессии → список событий для страницы (полностью)."""
+        items = []
+        title = ""
+        raw = ""
+        import tempfile
+        for attempt in (1, 2):
+            tmp = None
+            try:
+                fd, tmp = tempfile.mkstemp(suffix=".json", dir=str(STATE_DIR))
+                os.close(fd)
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    subprocess.run([opencode_bin(self.cfg), "session", "export", sid],
+                                   stdout=fh, stderr=subprocess.DEVNULL, timeout=180,
+                                   cwd=str(HOME))
+                with open(tmp, encoding="utf-8") as fh:
+                    raw = fh.read()
+                d = json.loads(raw)
+                break
+            except json.JSONDecodeError:
+                log(f"export {sid}: битый JSON (попытка {attempt}, {len(raw)} байт)")
+                d = None
+            except Exception as e:
+                log(f"export {sid}: {e}")
+                d = None
+            finally:
+                if tmp:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+            time.sleep(0.5)
+        if d is None:
+            # спасти то, что дочиталось: откусываем до последней целой скобки
+            try:
+                cut = raw.rfind('}], "time"')
+                if cut < 0:
+                    cut = raw.rfind("}]")
+                if cut > 0:
+                    d = json.loads(raw[:cut + 2].rstrip().rstrip(",") + "]}")
+            except Exception:
+                d = {}
+        title = (d.get("info") or {}).get("title") or title
+        model = ""
+        m = (d.get("info") or {}).get("model") or {}
+        if m.get("providerID") and m.get("id"):
+            model = f"{m['providerID']}/{m['id']}"
+            if m.get("variant"):
+                model += f"#{m['variant']}"   # вариант = другие лимиты (план max)!
+        msgs = d.get("messages") or []
+        if max_messages:
+            msgs = msgs[-max_messages:]
+        for m in msgs:
+            t = m.get("type")
+            if t in ("user", "synthetic"):
+                txt = (m.get("text") or "").strip()
+                if txt:
+                    items.append({"ev": "you", "text": txt})
+            elif t == "compaction":
+                txt = (m.get("summary") or "").strip()
+                items.append({"ev": "compact", "text": txt})
+            elif t == "assistant":
+                for p in (m.get("content") or []):
+                    if p.get("type") == "reasoning":
+                        txt = (p.get("text") or "").strip()
+                        if txt:
+                            t = p.get("time") or {}
+                            b = t.get("start", t.get("created", 0))
+                            e = t.get("end", t.get("completed", 0))
+                            items.append({"ev": "think", "text": txt[:4000],
+                                          "ms": max(0, int(e - b))})
+                    elif p.get("type") == "tool":
+                        name, arg, ms, full, status = tool_info(p)
+                        items.append({"ev": "tool", "name": name, "arg": arg,
+                                      "ms": ms, "full": full, "status": status})
+                    elif p.get("type") == "text":
+                        txt = (p.get("text") or "").strip()
+                        if txt:
+                            items.append({"ev": "md", "text": txt})
+        # держим хвост: свежие сообщения важнее, а кап — от раздувания DOM
+        usage = None
+        for m in reversed(msgs):
+            if m.get("type") == "assistant" and m.get("tokens"):
+                tk = m["tokens"]
+                total = int(tk.get("input") or 0) + int(tk.get("output") or 0) \
+                    + int(tk.get("reasoning") or 0)
+                c = tk.get("cache")
+                if isinstance(c, dict):
+                    total += int(c.get("read") or 0) + int(c.get("write") or 0)
+                mm = m.get("model") or {}
+                key = f"{mm.get('providerID','')}/{mm.get('id','')}"
+                ctx = self.ctx_limits.get(key) if self.ctx_limits else None
+                usage = {"total": total, "ctx": ctx}
+                break
+        return items[-3000:], title, model, usage
+
+    def _emit_history(self, sid):
+        def worker():
+            items, title, model, usage = self.fetch_history(sid)
+            if title and title != self.session_title:
+                self.session_title = title
+            # наследуем модель сессии, если модель не выбрана вручную в попапе
+            if model and (not self.model or not self._model_manual):
+                if model != self.model:
+                    self.model = model
+                    self.emit_ev({"ev": "note", "name": "model",
+                                  "arg": self.short_model()})
+            self.emit_ev({"ev": "meta", **self.meta_obj()})
+            self.emit_ev({"ev": "history", "title": title or self.session_title,
+                          "items": items})
+            if usage and usage.get("total"):
+                self.emit_ev({"ev": "usage", "total": usage["total"],
+                              "ctx": usage.get("ctx")})
+            self._persist()
+        threading.Thread(target=worker, daemon=True).start()
+
+    def custom_agents(self):
+        if self._agents is not None:
+            return self._agents
+        agents = []
+        for pth in (CONFIG_DIR / "opencode/opencode.json", HOME / ".opencode/config/opencode.json"):
+            try:
+                data = json.loads(pth.read_text(encoding="utf-8"))
+                ag = data.get("agents") or {}
+                if isinstance(ag, dict):
+                    agents = [k for k in ag.keys() if k not in ("build", "plan")]
+                break
+            except Exception:
+                continue
+        self._agents = agents
+        return agents
+
+    # ---------- слоты для страницы
+
+    # ---------- очередь сообщений
+
+    def _queue_push(self, text):
+        with self._qlock:
+            self._qseq += 1
+            qid = self._qseq
+            self._qitems.append({"id": qid, "text": text})
+            self._queued = len(self._qitems)
+        self.emit_ev({"ev": "queued_add", "id": qid, "text": text})
+        return qid
+
+    def _queue_pop(self, qid=None, text=None):
+        """Снять сообщение из очереди: по id, иначе по тексту, иначе самое старое."""
+        with self._qlock:
+            if not self._qitems:
+                return None
+            idx = 0
+            if qid is not None:
+                idx = next((i for i, x in enumerate(self._qitems) if x["id"] == qid), None)
+            elif text:
+                idx = next((i for i, x in enumerate(self._qitems) if x["text"] == text), 0)
+            if idx is None:
+                return None
+            it = self._qitems.pop(idx)
+            self._queued = len(self._qitems)
+        return it
+
+    def _queue_clear(self):
+        with self._qlock:
+            had = bool(self._qitems)
+            self._qitems = []
+            self._queued = 0
+        if had:
+            self.emit_ev({"ev": "queued_clear"})
+
+    def _enqueue_prompt(self, text):
+        """Свой ход ещё идёт: кладём сообщение в очередь сессии (стрим уже слушает)."""
+        sid = self.session_id
+        qid = self._queue_push(text)
+        try:
+            self.server.post(f"/api/session/{sid}/prompt", {"text": text})
+            if not self.busy:
+                # ход успел закончиться, стрим закрыт — чип некому снимать
+                self._queue_clear()
+        except Exception as e:
+            log(f"enqueue: {e}")
+            if self._queue_pop(qid=qid):
+                self.emit_ev({"ev": "queued_drop", "id": qid})
+            self.emit_ev({"ev": "error", "text": str(e)[:300]})
+
+    def resume(self):
+        """Открыли попап, а сессия в работе — показываем рабочее состояние
+        и подключаемся к стриму продолжающегося хода."""
+        if self.busy or not self.session_id:
+            return
+        try:
+            if not self.server.ensure():
+                return
+            act = self.server.get("/api/session/active") or {}
+            if not (act.get("data") or {}).get(self.session_id):
+                return
+        except Exception as e:
+            log(f"resume check: {e}")
+            return
+        self.busy = True
+        self.emit_ev({"ev": "busy", "on": True})
+        self._stop_flag = {"stop": False}
+        threading.Thread(target=self._run_stream, args=(None,), daemon=True).start()
+
+    @Slot(str)
+    def submit(self, text):
+        text = text.strip()
+        if not text:
+            return
+        if self.busy:
+            if not self.session_id:
+                self.emit_ev({"ev": "note", "name": "занят", "arg": "ещё думаю…"})
+                return
+            threading.Thread(target=self._enqueue_prompt, args=(text,), daemon=True).start()
+            return
+        self.busy = True
+        self.answer_parts = 0
+        self.emit_ev({"ev": "busy", "on": True})
+        self._stop_flag = {"stop": False,
+                           "close": lambda resp: setattr(self, "_sse_close",
+                                                         lambda: resp.close())}
+        threading.Thread(target=self._run_stream, args=(text,), daemon=True).start()
+
+    @Slot()
+    def stop(self):
+        if self.busy:
+            log("stop: interrupt")
+            self._stop_flag["stop"] = True
+            if self.session_id:
+                try:
+                    self.server.post(f"/api/session/{self.session_id}/interrupt")
+                except Exception as e:
+                    log(f"interrupt: {e}")
+            self.busy = False
+            self._queue_clear()
+            self.emit_ev({"ev": "busy", "on": False})
+
+    def listen(self, why=""):
+        """Подключиться к стриму уже запущенного хода (compact/команда)."""
+        if self.busy or not self.session_id:
+            return
+        self.busy = True
+        self.answer_parts = 0
+        self.emit_ev({"ev": "busy", "on": True})
+        self._stop_flag = {"stop": False,
+                           "close": lambda resp: setattr(
+                               self, "_sse_close", lambda: resp.close())}
+        threading.Thread(target=self._run_stream, args=(None,), daemon=True).start()
+
+    def _server_action(self, kind, name=""):
+        if not self.session_id:
+            self.emit_ev({"ev": "note", "name": "сессия",
+                          "arg": "сначала начни диалог"})
+            return
+        try:
+            if not self.server.ensure():
+                raise RuntimeError("сервис opencode не найден")
+            if kind == "compact":
+                self.server.post(f"/api/session/{self.session_id}/compact")
+                self.emit_ev({"ev": "note", "name": "compact",
+                              "arg": "сжимаю контекст"})
+            else:
+                self.server.post(f"/api/session/{self.session_id}/command",
+                                 {"name": name, "text": ""})
+                self.emit_ev({"ev": "note", "name": "команда", "arg": name})
+            self.listen()
+        except Exception as e:
+            log(f"{kind}: {e}")
+            self.emit_ev({"ev": "error", "text": str(e)[:200]})
+
+    def _usage_async(self, fallback=0):
+        """Дебаунс: один запрос за шаг, а не на каждое событие."""
+        if getattr(self, "_usage_busy", False):
+            self._usage_fallback = fallback
+            return
+        self._usage_busy = True
+
+        def job():
+            try:
+                time.sleep(0.3)
+                self._usage_live(fallback)
+            finally:
+                self._usage_busy = False
+        threading.Thread(target=job, daemon=True).start()
+
+    def _usage_live(self, fallback=0):
+        """Занятый контекст = токены последнего assistant-сообщения."""
+        try:
+            if not self.session_id:
+                return
+            ctx = self.context_limit()
+            r = self.server.get(
+                f"/api/session/{self.session_id}/message?limit=5&order=desc") or {}
+            for m in (r.get("data") or []):
+                if m.get("type") != "assistant":
+                    continue
+                tk = m.get("tokens") or {}
+                total = int(tk.get("input") or 0) + int(tk.get("output") or 0) \
+                    + int(tk.get("reasoning") or 0)
+                c = tk.get("cache")
+                if isinstance(c, dict):
+                    total += int(c.get("read") or 0) + int(c.get("write") or 0)
+                elif isinstance(c, (int, float)):
+                    total += int(c)
+                if total > 0:
+                    self.emit_ev({"ev": "usage", "total": total, "ctx": ctx})
+                    return
+            # у сообщений нет токенов — берём событие, если оно правдоподобно
+            if fallback and (not ctx or fallback <= ctx * 1.5):
+                self.emit_ev({"ev": "usage", "total": fallback, "ctx": ctx})
+        except Exception as e:
+            log(f"usage live: {e}")
+
+    def _inbox_cancel_all(self):
+        """Снять сообщения из серверной очереди сессии (перед скипом по Esc)."""
+        try:
+            if not self.session_id:
+                return
+            r = self.server.get(f"/api/session/{self.session_id}/inbox") or {}
+            for it in (r.get("data") or []):
+                iid = it.get("id")
+                if iid:
+                    self.server.req(
+                        "DELETE", f"/api/session/{self.session_id}/inbox/{iid}")
+            log("esc: серверная очередь снята")
+        except Exception as e:
+            log(f"inbox cancel: {e}")
+
+    @Slot()
+    def escInterrupt(self):
+        """Второй Esc: остановить ход; при очереди — скип ожидания (сразу следующий)."""
+        if not self.busy:
+            return
+        now = time.time()
+        if now - getattr(self, "_esc_last", 0) < 0.8:
+            return          # автоповтор клавиши — не долбим сервер
+        self._esc_last = now
+        log("esc: interrupt")
+        # после остановки сразу запустим первое сообщение из очереди
+        self._esc_queue_skip = bool(self._qitems)
+        if self._esc_queue_skip:
+            self._inbox_cancel_all()
+        self.emit_ev({"ev": "note", "name": "стоп", "arg": "останавливаю ход"})
+        if self.session_id:
+            try:
+                if self.server.ensure():
+                    self.server.post(f"/api/session/{self.session_id}/interrupt")
+            except Exception as e:
+                log(f"esc interrupt: {e}")
+        # сама очередь поедет в _run_stream, когда ход реально завершится
+        threading.Thread(target=self._esc_watchdog, daemon=True).start()
+
+    def _esc_watchdog(self):
+        """Сервер может не прислать событие об остановке — снимаем busy сами."""
+        for _ in range(10):
+            time.sleep(0.5)
+            if not self.busy:
+                return
+        if not self.busy:
+            return
+        log("esc: сервер молчит — снимаю busy локально")
+        try:
+            self._stop_flag["stop"] = True
+            closer = getattr(self, "_sse_close", None)
+            if closer:
+                closer()
+        except Exception:
+            pass
+        self.busy = False
+        self.emit_ev({"ev": "busy", "on": False})
+
+    @Slot()
+    def hide(self):
+        if self._hide_cb:
+            self._hide_cb()
+
+    @Slot(int, result=bool)
+    def setQueue(self, n):
+        """Очередь сообщений: расширяет окно влево под колонку чипов.
+        Возвращает True, когда запрос на изменение размера отправлен — страница
+        показывает чип только после этого, чтобы он не мигал поверх панелей."""
+        if self._queue_cb:
+            self._queue_cb(int(n))
+        return True
+
+    @Slot(float, float)
+    def dragBy(self, dx, dy):
+        if self._drag_cb:
+            self._drag_cb(int(dx), int(dy))
+
+    @Slot(result=bool)
+    def beginDrag(self):
+        """Нативный drag (xdg_toplevel_move) — основной путь на Wayland."""
+        if self._native_drag_cb:
+            try:
+                return bool(self._native_drag_cb())
+            except Exception:
+                return False
+        return False
+
+    @Slot(result=str)
+    def theme(self):
+        return json.dumps({"dark": self.kde.is_dark, "vars": self.kde.vars()},
+                          ensure_ascii=False)
+
+    @Slot(result=str)
+    def meta(self):
+        return json.dumps(self.meta_obj(), ensure_ascii=False)
+
+    @Slot(result=str)
+    def welcomed(self):
+        if self.state.get("welcomed"):
+            return "no"
+        self.state["welcomed"] = True
+        save_state(self.state)
+        return "yes"
+
+    @Slot(str, result=str)
+    def palette(self, level):
+        now = time.time()
+
+        def when(ts):
+            age = now - ts / 1000
+            if age < 86400:
+                return "Сегодня"
+            if age < 172800:
+                return "Вчера"
+            return "Раньше"
+
+        if level == "root":
+            items = [
+                {"g": "Сессия", "t": "Новая сессия", "act": "new_session"},
+                {"g": "Сессия", "t": "Переключить сессию",
+                 "d": (self.session_title or "новая")[:40], "go": "sessions"},
+                {"g": "Модель и агент", "t": "Переключить модель",
+                 "d": self.short_model(), "go": "models"},
+                {"g": "Модель и агент", "t": "Переключить агента",
+                 "d": self.agent, "go": "agents"},
+            ]
+            if self.session_id:
+                items.append({"g": "Действия", "t": "Сжать контекст",
+                              "d": "compact — сводка истории", "act": "compact"})
+            for c in (self.commands_cache or []):
+                items.append({"g": "Команды", "t": "/" + (c.get("name") or ""),
+                              "d": (c.get("description") or "")[:56],
+                              "act": "run_command", "val": c.get("name") or ""})
+            if self.busy:
+                items.append({"g": "Управление", "t": "Остановить генерацию", "act": "stop"})
+            return json.dumps(items, ensure_ascii=False)
+
+        if level == "sessions":
+            pinned = set(self.state.get("pinned") or [])
+            rows = []
+            for s in self.sessions_cache[:60]:
+                sid = s.get("id", "")
+                row = {"g": "Недавние",
+                       "t": (s.get("title") or sid)[:60],
+                       "d": "", "on": sid == self.session_id,
+                       "act": "switch_session", "val": sid, "sid": sid}
+                if sid in pinned:
+                    row["g"] = "Закреплённые"
+                    row["t"] = "📌 " + row["t"]
+                rows.append(row)
+            rows.sort(key=lambda r: 0 if r["g"] == "Закреплённые" else 1)
+            if not rows:
+                rows = [{"t": "(пока нет сессий)"}]
+            return json.dumps(rows, ensure_ascii=False)
+
+        if level == "models":
+            items = []
+            for m in self.models_cache:
+                items.append({"g": m.split("/", 1)[0], "t": m.split("/", 1)[-1],
+                              "on": m == self.model, "act": "switch_model", "val": m})
+            if not items:
+                items = [{"t": "(список загружается…)"}]
+            return json.dumps(items, ensure_ascii=False)
+
+        if level == "agents":
+            items = [
+                {"t": "build", "d": "Полный доступ к инструментам", "on": self.agent == "build",
+                 "act": "switch_agent", "val": "build"},
+                {"t": "plan", "d": "Только чтение, без изменений", "on": self.agent == "plan",
+                 "act": "switch_agent", "val": "plan"},
+            ]
+            for a in self.custom_agents():
+                items.append({"t": a, "on": self.agent == a, "act": "switch_agent", "val": a})
+            return json.dumps(items, ensure_ascii=False)
+
+        return "[]"
+
+    @Slot(str, str)
+    def action(self, name, val):
+        log(f"action: {name} {val}")
+        if name == "new_session":
+            self.session_id = ""
+            self.session_title = ""
+            self._manual_session = True
+            self._model_manual = False  # модель наследуется (или выбор попапа)
+            self._queue_clear()
+            self.emit_ev({"ev": "reset", "title": "Новая сессия"})
+            self.emit_ev({"ev": "note", "name": "session", "arg": "новая"})
+        elif name == "switch_session":
+            self.session_id = val
+            self._manual_session = True
+            self._model_manual = False  # модель — как в выбранной сессии
+            self._queue_clear()
+            title = next((s.get("title") or val for s in self.sessions_cache
+                          if s.get("id") == val), val)
+            self.session_title = title
+            self.emit_ev({"ev": "reset", "title": title})
+            self.emit_ev({"ev": "note", "name": "session", "arg": title[:40]})
+            self._emit_history(val)
+            threading.Timer(2.5, self.resume).start()
+        elif name == "switch_model":
+            self.model = val
+            self._model_manual = True
+            # применяем и к открытой сессии сразу (Model.Ref объектом)
+            if self.session_id:
+                try:
+                    if self.server.ensure():
+                        ref = self.model_ref()
+                        if ref:
+                            self.server.post(
+                                f"/api/session/{self.session_id}/model",
+                                {"model": ref})
+                except Exception as e:
+                    log(f"switch model: {e}")
+            self.emit_ev({"ev": "meta", **self.meta_obj()})
+            self.emit_ev({"ev": "note", "name": "model", "arg": self.short_model()})
+        elif name == "switch_agent":
+            self.agent = val
+            self.emit_ev({"ev": "meta", **self.meta_obj()})
+            self.emit_ev({"ev": "note", "name": "agent", "arg": val})
+        elif name == "rename_session":
+            try:
+                if not self.server.ensure():
+                    raise RuntimeError("сервис opencode не найден")
+                sid, title = json.loads(val)
+                self.server.req("PATCH", f"/api/session/{sid}", {"title": title})
+                for s in self.sessions_cache:
+                    if s.get("id") == sid:
+                        s["title"] = title
+                if self.session_id == sid:
+                    self.session_title = title
+                    self.emit_ev({"ev": "meta", **self.meta_obj()})
+                self.emit_ev({"ev": "note", "name": "переименовано", "arg": title[:40]})
+                log(f"сессия {sid[-8:]} → «{title[:40]}»")
+            except Exception as e:
+                log(f"rename session: {e}")
+                self.emit_ev({"ev": "note", "name": "ошибка", "arg": "не переименовалось"})
+        elif name == "compact":
+            self._server_action("compact")
+        elif name == "run_command":
+            self._server_action("command", val)
+        elif name == "stop":
+            self.stop()
+        elif name == "pin":
+            pinned = set(self.state.get("pinned") or [])
+            if val in pinned:
+                pinned.discard(val)
+                self.emit_ev({"ev": "note", "name": "pin", "arg": "откреплено"})
+            else:
+                pinned.add(val)
+                self.emit_ev({"ev": "note", "name": "pin", "arg": "закреплено"})
+            self.state["pinned"] = sorted(pinned)
+            save_state(self.state)
+        elif name == "del_session":
+            try:
+                if not self.server.ensure():
+                    raise RuntimeError("сервис opencode не найден")
+                self.server.req("DELETE", f"/api/session/{val}")
+                self.sessions_cache = [s for s in self.sessions_cache
+                                       if s.get("id") != val]
+                self.state["pinned"] = [p for p in self.state.get("pinned", [])
+                                        if p != val]
+                if self.session_id == val:
+                    self.session_id = ""
+                    self.session_title = ""
+                    self.emit_ev({"ev": "reset", "title": "Новая сессия"})
+                    self.emit_ev({"ev": "meta", **self.meta_obj()})
+                self.emit_ev({"ev": "note", "name": "удалено", "arg": "сессия удалена"})
+                log(f"сессия {val[-8:]} удалена")
+            except Exception as e:
+                log(f"delete session: {e}")
+                self.emit_ev({"ev": "note", "name": "ошибка",
+                              "arg": "не удалилось (занята?)"})
+            self._persist()
+            threading.Thread(target=self._refresh_caches, daemon=True).start()
+        self._persist()
+
+    def _persist(self):
+        self.state.update({
+            "session": self.session_id,
+            "session_title": self.session_title,
+            "model": self.model,
+            "model_manual": self._model_manual,
+            "agent": self.agent,
+        })
+        save_state(self.state)
+
+    # ---------- поток событий opencode (SSE)
+
+    def _run_stream(self, text):
+        """Отправка промпта (text) или возобновление работающей сессии
+        (text=None: ход уже идёт — только слушаем стрим) и вывод событий."""
+        queued_id = None
+        try:
+            if not self.server.ensure():
+                if text is not None:
+                    self.emit_ev({"ev": "you", "text": text})
+                self.emit_ev({"ev": "error", "text": "не найден сервис opencode "
+                               "(запусти opencode один раз)"})
+                self.busy = False
+                self.emit_ev({"ev": "busy", "on": False})
+                return
+            if text is not None:
+                if self.session_id:
+                    # сессия может быть занята (например, идёт ход в TUI) — промпт
+                    # встанет в очередь; тогда вместо реплики показываем чип слева,
+                    # а сама реплика появится в выводе, когда подойдёт её ход
+                    try:
+                        act = self.server.get("/api/session/active") or {}
+                        if (act.get("data") or {}).get(self.session_id):
+                            queued_id = self._queue_push(text)
+                    except Exception as e:
+                        log(f"active check: {e}")
+                if queued_id is None:
+                    self.emit_ev({"ev": "you", "text": text})
+                if not self.session_id:
+                    body = self._new_session_body()
+                    r = self.server.post("/api/session", body)
+                    self.session_id = (r.get("data") or {}).get("id", "")
+                    log(f"новая сессия {self.session_id}")
+                self.emit_ev({"ev": "meta", **self.meta_obj()})
+                self.server.post(f"/api/session/{self.session_id}/prompt", {"text": text})
+            else:
+                log(f"resume: сессия {self.session_id[-8:]} в работе — подключаюсь к стриму")
+        except Exception as e:
+            log(f"submit: {e}")
+            if queued_id is not None and self._queue_pop(qid=queued_id):
+                self.emit_ev({"ev": "queued_drop", "id": queued_id})
+            self.emit_ev({"ev": "error", "text": str(e)[:300]})
+            self.busy = False
+            self.emit_ev({"ev": "busy", "on": False})
+            return
+
+        deadline = time.time() + int(self.cfg.get("timeout_s", 300))
+        finished = {"done": False}
+        self._sse_close = None
+        activity = {"t": time.time(), "saw_answer": False}
+        tools_open = set()   # id вызовов инструментов в полёте
+
+        def touch(answer=False):
+            activity["t"] = time.time()
+            if answer:
+                activity["saw_answer"] = True
+
+        def finish():
+            if finished["done"]:
+                return
+            finished["done"] = True
+            self._stop_flag["stop"] = True
+            closer = getattr(self, "_sse_close", None)
+            if closer:
+                threading.Timer(0.05, closer).start()
+
+        def monitor():
+            """Страховка: ответ закончился, инструменты закрыты и 15с тишины."""
+            while not finished["done"] and not self._stop_flag["stop"]:
+                time.sleep(1)
+                idle = time.time() - activity["t"]
+                # инструменты в работе = ход продолжается, даже если событий нет
+                if activity["saw_answer"] and idle > 15 and not tools_open \
+                        and not self._qitems:
+                    log(f"finish по тишине (idle={idle:.0f}s)")
+                    finish()
+                    return
+                if time.time() > deadline:
+                    log("finish по дедлайну")
+                    self.emit_ev({"ev": "error", "text": "таймаут ответа"})
+                    finish()
+                    return
+
+        think_st = {"got": False, "logged": False}
+
+        def on_event(ev):
+            if finished["done"]:
+                return
+            typ = ev.get("type", "")
+            d = ev.get("data") or {}
+            if _EVLOG:
+                log(f"ev {typ} {(d.get('text') or '')[:0]}")
+            if d.get("sessionID") and d["sessionID"] != self.session_id:
+                return
+            # любое событие сессии = активность (ход продолжается)
+            if typ.startswith("session."):
+                touch()
+            if typ == "session.tool.input.started":
+                if d.get("id"):
+                    tools_open.add(d["id"])
+            elif typ in ("session.tool.success", "session.tool.failed"):
+                if d.get("id"):
+                    tools_open.discard(d["id"])
+            if typ.startswith("session.reasoning."):
+                touch()
+                sub = typ.rsplit(".", 1)[1]
+                txt = d.get("delta") or d.get("text") or d.get("content") or ""
+                if not isinstance(txt, str):
+                    txt = ""
+                if not think_st["logged"]:
+                    think_st["logged"] = True
+                    log(f"reasoning ev: {typ} keys={list(d.keys())}")
+                if sub == "started":
+                    think_st["got"] = False
+                    self.emit_ev({"ev": "think_start"})
+                elif sub == "delta":
+                    if txt:
+                        think_st["got"] = True
+                        self.emit_ev({"ev": "think_delta", "text": txt})
+                elif sub == "ended":
+                    if txt and not think_st["got"]:
+                        self.emit_ev({"ev": "think_delta", "text": txt})
+                    think_st["got"] = False
+                    self.emit_ev({"ev": "think_end"})
+            elif typ == "session.text.started":
+                touch()
+                self.emit_ev({"ev": "answer_start"})
+            elif typ == "session.text.delta":
+                touch()
+                if d.get("delta"):
+                    self.emit_ev({"ev": "answer_delta", "text": d["delta"]})
+            elif typ == "session.text.ended":
+                touch(answer=True)
+                self.emit_ev({"ev": "answer_end"})
+            elif typ == "session.tool.input.started":
+                touch()
+                self.emit_ev({"ev": "tool_start", "id": d.get("id", ""),
+                              "name": d.get("name", "tool")})
+            elif typ == "session.tool.input.ended":
+                touch()
+                arg = d.get("text") or ""
+                try:
+                    args = json.loads(arg)
+                    arg = args.get("command") or args.get("path") or \
+                          next((str(v) for v in args.values() if isinstance(v, str)), arg)
+                except Exception:
+                    pass
+                self.emit_ev({"ev": "tool_args", "id": d.get("id", ""), "arg": arg[:120]})
+            elif typ == "session.tool.success":
+                touch()
+                outp = ""
+                for c in (d.get("content") or []):
+                    if isinstance(c, dict) and c.get("type") == "text":
+                        outp += c.get("text", "")
+                self.emit_ev({"ev": "tool_end", "id": d.get("id", ""),
+                              "status": "done", "output": outp.strip()[:600]})
+            elif typ == "session.tool.failed":
+                self.emit_ev({"ev": "tool_end", "id": d.get("id", ""), "status": "error",
+                              "output": json.dumps(d.get("error") or {}, ensure_ascii=False)[:300]})
+            elif typ == "session.retry.scheduled":
+                err = ((d.get("error") or {}).get("message") or "")[:80]
+                self.emit_ev({"ev": "status", "text": "повтор… " + err})
+            elif typ == "session.usage.updated":
+                tk = d.get("tokens") or {}
+                total = int(tk.get("input") or 0) + int(tk.get("output") or 0) \
+                    + int(tk.get("reasoning") or 0)
+                c = tk.get("cache")
+                if isinstance(c, dict):
+                    total += int(c.get("read") or 0) + int(c.get("write") or 0)
+                elif isinstance(c, (int, float)):
+                    total += int(c)
+                # usage.updated копится за сессию (миллионы) — точное «сколько
+                # занято сейчас» берём из последнего assistant-сообщения
+                self._usage_async(total)
+            elif typ == "session.compaction.started":
+                self.emit_ev({"ev": "compact_start"})
+            elif typ == "session.compaction.delta":
+                touch(answer=True)   # компакция = активность хода
+                self.emit_ev({"ev": "compact_delta", "text": d.get("text") or ""})
+            elif typ == "session.compaction.ended":
+                touch(answer=True)
+                self.emit_ev({"ev": "compact_end"})
+            elif typ == "session.inbox.delivered":
+                # сообщение из очереди дошло до исполнения — чип перетекает в вывод
+                if not think_st.get("inbox_logged"):
+                    think_st["inbox_logged"] = True
+                    log(f"inbox.delivered keys={list(d.keys())}")
+                dtext = d.get("text") if isinstance(d.get("text"), str) else None
+                it = self._queue_pop(text=dtext)
+                if it:
+                    touch()
+                    self.emit_ev({"ev": "queued_deliver", "id": it["id"], "text": it["text"]})
+            elif typ == "session.execution.succeeded":
+                if self._qitems:
+                    touch()  # в очереди ещё сообщения — ждём их исполнения
+                else:
+                    finish()
+            elif typ == "session.execution.failed":
+                err = ((d.get("error") or {}).get("message") or "выполнение прервано")[:200]
+                if "nterrupt" in err or "bort" in err or "отмен" in err:
+                    self.emit_ev({"ev": "note", "name": "стоп", "arg": "ход остановлен"})
+                else:
+                    self.emit_ev({"ev": "error", "text": err})
+                finish()
+
+        threading.Thread(target=monitor, daemon=True).start()
+        try:
+            self.server.sse(on_event, self._stop_flag,
+                            timeout_s=max(60, int(deadline - time.time())),
+                            deadline=deadline)
+        except Exception as e:
+            if not finished["done"] and not self._stop_flag["stop"]:
+                self.emit_ev({"ev": "error", "text": f"стрим оборвался: {e}"[:200]})
+        self.busy = False
+        self.answer_parts = 1
+        skip = getattr(self, "_esc_queue_skip", False)
+        self._esc_queue_skip = False
+        self._persist()
+        self.emit_ev({"ev": "busy", "on": False})
+        threading.Thread(target=self._refresh_caches, daemon=True).start()
+        if skip and self._qitems:
+            # Esc при очереди: не ждём доставку сервером — сразу следующий
+            it = self._queue_pop()
+            if it:
+                log(f"esc: скип очереди → «{it['text'][:30]}»")
+                self.emit_ev({"ev": "queued_del"})
+                self.submit(it["text"])
+                return
+        self._queue_clear()
+
+
+# ------------------------------------------------------------------ орб-кнопка
+
+class OrbWin(QWidget):
+    """Отдельная «сфера» — появляется внизу по центру на время анимации."""
+
+    SIZE = 64          # холст (52 круг + тень)
+    R = 26             # радиус круга
+
+    def __init__(self, theme, on_click):
+        super().__init__(None,
+                         Qt.Window | Qt.FramelessWindowHint |
+                         Qt.WindowStaysOnTopHint | Qt.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setWindowTitle("opencode orb")
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setCursor(Qt.PointingHandCursor)
+        self.theme = theme
+        self.on_click = on_click
+        self.orb_bottom = 14   # px от низа экрана
+        self._place_cb = None
+        self.pos_fn = None
+        self._fade = QVariantAnimation(self)
+        self._fade.setDuration(260)
+        self._fade.valueChanged.connect(self._set_alpha)
+        self._hide_timer = None
+        self._reveal_delay = 380
+        self._alpha = 0.0
+        self._t = 0.0
+        self._anim = QVariantAnimation(self)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.setDuration(1800)
+        self._anim.setLoopCount(-1)
+        self._anim.valueChanged.connect(self._tick)
+
+    def _tick(self, v):
+        self._t = float(v)
+        self.update()
+
+    def _set_alpha(self, v):
+        # на Wayland windowOpacity — no-op, гасим альфой отрисовки
+        self._alpha = v / 100.0
+        self.update()
+
+    def _start_fade(self, to):
+        self._fade.stop()
+        self._fade.setStartValue(int(self._alpha * 100))
+        self._fade.setEndValue(to)
+        self._fade.start()
+
+    def place(self, screen=None):
+        if self.pos_fn:
+            self.move(*self.pos_fn())
+
+    def fade_in(self):
+        if self._hide_timer is not None:
+            self._hide_timer.stop()
+            self._hide_timer = None
+        self.place()
+        self._alpha = 0.0
+        self._anim.start()
+        self.show()
+        self.raise_()
+        # позицию надёжно ставить уже после map — KWin может игнорировать move до показа
+        if self._place_cb:
+            for d in (30, 120, 260):
+                QTimer.singleShot(d, self._place_cb)
+        # показываем звезду, только когда KWin поставил её на место (иначе мелькнёт в центре)
+        QTimer.singleShot(self._reveal_delay, lambda: self._start_fade(100))
+
+    def fade_out(self):
+        self._start_fade(0)
+        if self._hide_timer is None:
+            self._hide_timer = QTimer(self)
+            self._hide_timer.setSingleShot(True)
+            self._hide_timer.timeout.connect(self.hide)
+        self._hide_timer.start(300)
+        QTimer.singleShot(320, lambda: self._anim.stop() if self._alpha <= 0.01 else None)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.LeftButton:
+            self.on_click()
+
+    def paintEvent(self, ev):
+        t = self.theme
+        A = self._alpha
+        if A <= 0.01:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        c = QPointF(self.SIZE / 2, self.SIZE / 2)
+        r = self.R
+
+        # мягкая тень
+        for i in range(6, 0, -1):
+            a = int(46 * ((7 - i) / 7) ** 2.4 * A)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(0, 0, 0, a))
+            p.drawEllipse(c, r + i, r + i)
+
+        # стеклянный круг
+        alpha = int((210 if not t.is_dark else 195) * A)
+        bg = QColor(*t.bg, alpha)
+        p.setBrush(bg)
+        border = QColor(*t.fg, int((30 if not t.is_dark else 60) * A))
+        p.setPen(QPen(border, 1))
+        p.drawEllipse(c, r, r)
+
+        # звёздочка: медленный спин + «дыхание» (сжатие/раскрытие)
+        import math
+        fg = QColor(*t.fg, int(255 * A))
+        pen = QPen(fg, 2.2)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        ph = self._t * 2 * math.pi
+        k = 10.5 * (0.8 + 0.2 * (0.5 + 0.5 * math.sin(ph)))
+        rot = 90 + self._t * 90          # четверть оборота за цикл
+        for i in range(4):
+            a1 = math.radians(rot + 45 * i)
+            a2 = a1 + math.pi
+            p.drawLine(QPointF(c.x() + k * math.cos(a1), c.y() - k * math.sin(a1)),
+                       QPointF(c.x() + k * math.cos(a2), c.y() - k * math.sin(a2)))
+
+
+# --------------------------------------------------------------------- окно
+
+class Host(QWidget):
+    def __init__(self, cfg, state, with_orb=True):
+        super().__init__(None,
+                         Qt.Window | Qt.FramelessWindowHint |
+                         Qt.WindowStaysOnTopHint | Qt.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setWindowTitle("opencode popup")
+        self.cfg = cfg
+        self.state = state
+        self._hide_token = 0
+        self._no_save = False
+        self._kwin_ok = False   # «попап в цели» по подтверждению самого KWin
+        self._queue_on = False  # расширение под колонку очереди
+
+        self.backend = Backend(cfg, state)
+        self.backend._hide_cb = self.hide_popup
+        self.backend._drag_cb = self.drag_by
+        self.backend._native_drag_cb = self.begin_native_drag
+        self.backend._queue_cb = self.set_queue
+
+        self.with_orb = with_orb
+        self.orb = None
+        if with_orb:
+            self.orb = OrbWin(self.backend.kde, self.toggle)
+            self.orb.pos_fn = self._orb_pos
+            self.orb._place_cb = lambda: (self.orb.place(), self.orb.raise_())
+
+        self.view = QWebEngineView(self)
+        self.view.setAttribute(Qt.WA_TranslucentBackground)
+        page = self.view.page()
+        page.setBackgroundColor(Qt.transparent)
+
+        self.channel = QWebChannel(self)
+        self.channel.registerObject("py", self.backend)
+        page.setWebChannel(self.channel)
+        self.backend.event.connect(self._push_event)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.view)
+
+        self.resize(int(cfg["width"]), int(cfg["height"]))
+        # ?v=mtime — cache-buster, чтобы Chromium не отдавал старую версию файла
+        url = QUrl.fromLocalFile(str(INDEX_HTML))
+        url.setQuery(f"v={int(INDEX_HTML.stat().st_mtime)}")
+        self.view.load(url)
+
+        self.save_timer = QTimer(self)
+        self.save_timer.setSingleShot(True)
+        self.save_timer.setInterval(400)
+        self.save_timer.timeout.connect(self._save_geometry)
+
+        self.watcher = QFileSystemWatcher([str(KDE_GLOBALS)], self)
+        self.watcher.fileChanged.connect(self._on_theme_file)
+
+    # ---------- события в страницу
+
+    def _push_event(self, payload):
+        safe = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+        self.view.page().runJavaScript(f"window.__ev && window.__ev({safe});")
+
+    def _on_theme_file(self, _):
+        if str(KDE_GLOBALS) not in self.watcher.files():
+            self.watcher.addPath(str(KDE_GLOBALS))
+        QTimer.singleShot(300, self._push_theme)
+
+    def _push_theme(self):
+        self.backend.kde.reload()
+        if self.orb:
+            self.orb.update()
+        data = json.dumps({"dark": self.backend.kde.is_dark,
+                           "vars": self.backend.kde.vars()}, ensure_ascii=False)
+        self.view.page().runJavaScript(f"window.__applyTheme && window.__applyTheme({data});")
+
+    # ---------- геометрия
+
+    def _screen(self):
+        scr = QGuiApplication.screenAt(QGuiApplication.primaryScreen().availableGeometry().center())
+        return scr or QGuiApplication.primaryScreen()
+
+    def _dock_top(self):
+        """Y верхней кромки дока (всё, что выше — свободно)."""
+        scr = self._screen()
+        g, av = scr.geometry(), scr.availableGeometry()
+        if av.bottom() < g.bottom() - 10:      # панель резервирует место
+            return av.bottom() + 1
+        return g.bottom() + 1 - int(self.cfg.get("dock_h", 54))
+
+    QUEUE_W = 236  # ширина колонки очереди слева
+
+    def _popup_geom(self):
+        """Попап — правый нижний угол, над доком; при очереди шире влево."""
+        g = self._screen().geometry()
+        w = int(self.cfg["width"]) + (self.QUEUE_W if self._queue_on else 0)
+        h = int(self.cfg["height"])
+        return {"title": "opencode popup", "x": g.x() + g.width() - w,
+                "y": self._dock_top() - h, "w": w, "h": h}
+
+    def set_queue(self, n):
+        """n>0 — расширяем окно влево под колонку очереди, 0 — обратно."""
+        want = n > 0
+        if want == self._queue_on:
+            return
+        self._queue_on = want
+        if self.isVisible():
+            geom = self._popup_geom()
+            right = self.x() + self.width()          # правый край фиксируем
+            self.setGeometry(right - geom["w"], self.y(), geom["w"], geom["h"])
+
+    def _orb_pos(self):
+        g = self._screen().geometry()
+        S = OrbWin.SIZE
+        return (g.x() + (g.width() - S) // 2,
+                self._dock_top() - int(self.cfg.get("orb_gap", 14)) - S + 6)
+
+    def _orb_geom(self):
+        x, y = self._orb_pos()
+        return {"title": "opencode orb", "nofocus": True,
+                "x": x, "y": y, "w": OrbWin.SIZE, "h": OrbWin.SIZE}
+
+    def _apply_kwin(self, tag=""):
+        """Позиции + «поверх окон» — силами композитора (нативный Wayland)."""
+        rules = [self._popup_geom(), self._orb_geom()]
+        log(f"kwin[{tag}]: цель popup=({rules[0]['x']},{rules[0]['y']}) "
+            f"orb=({rules[1]['x']},{rules[1]['y']}), qt-эхо=({self.x()},{self.y()})")
+        threading.Thread(target=kwin_apply, args=(rules,), daemon=True).start()
+
+    def _apply_kwin_until_ok(self, tag=""):
+        """KWin по умолчанию кладёт новые окна в центр («чуть правее центра»).
+
+        ВАЖНО: на Wayland клиент НЕ знает свою реальную позицию — self.x()/y()
+        лишь эхо собственного move(), композитор xdg_toplevel координаты не
+        сообщает. Поэтому успех по Qt-координатам проверить нельзя (старая
+        проверка `abs(self.x()-target)<=2` срабатывала мгновенно и скрипт
+        вообще не применялся — окно оставалось в KWin-дефолте). Применяем
+        скрипт БЕЗУСЛОВНО несколько раз с растущими задержками: окно попадает
+        в workspace.windowList() не мгновенно, а первый pass мог его не
+        увидеть. Реальный результат каждого pass'а виден в journald:
+        grep "oc-popup kwin" (print из самого KWin — до/после)."""
+        delays = (0, 300, 700, 1200, 1800, 2500)
+
+        def attempt(i):
+            if self._kwin_ok:
+                log(f"kwin[{tag}]: позиция подтверждена KWin — ретраи не нужны")
+                return
+            if not self.isVisible():
+                return  # попап успели скрыть — не мешаем анимации закрытия
+            self._apply_kwin(f"{tag}try{i}")
+            if i + 1 < len(delays):
+                QTimer.singleShot(delays[i + 1] - delays[i],
+                                  lambda: attempt(i + 1))
+
+        attempt(0)
+
+    def _place_default(self):
+        geom = self._popup_geom()
+        self.resize(geom["w"], geom["h"])
+        self.move(geom["x"], geom["y"])
+        if self.orb:
+            self.orb.place()
+
+    def begin_native_drag(self):
+        """Системное перетаскивание (xdg_toplevel_move) — родной жест Wayland."""
+        handle = self.windowHandle()
+        if handle is not None:
+            try:
+                return bool(handle.startSystemMove())
+            except Exception:
+                return False
+        return False
+
+    def drag_by(self, dx, dy):
+        # на Wayland клиент не может двигать окно сам — только KWin/жест
+        self.move(self.x() + dx, self.y() + dy)
+
+    def moveEvent(self, ev):
+        super().moveEvent(ev)
+        if not getattr(self, "_no_save", False):
+            self.save_timer.start()
+
+    def _save_geometry(self):
+        self.state.update({"popup_x": self.x(), "popup_y": self.y()})
+        save_state(self.state)
+
+    def _kwin_report(self, title, x, y, w, h):
+        """Приём реальной геометрии от KWin (callDBus из скрипта).
+        Это композиторная правда — в отличие от popup_x/popup_y (эхо клиента)."""
+        log(f"kwin report: [{title}] {x},{y} {w}x{h}")
+        if title == "opencode popup":
+            self.state.update({"kwin_popup_x": x, "kwin_popup_y": y,
+                               "kwin_popup_w": w, "kwin_popup_h": h})
+            t = self._popup_geom()
+            self._kwin_ok = abs(x - t["x"]) <= 2 and abs(y - t["y"]) <= 2
+            if self._kwin_ok:
+                log("kwin confirmed: попап в целевой позиции")
+            save_state(self.state)
+
+    # ---------- показ/скрытие
+
+    def _orb_screen_pos(self):
+        x, y = self._orb_pos()
+        return (x + OrbWin.SIZE // 2, y + OrbWin.SIZE // 2)
+
+    def show_popup(self):
+        self._hide_token += 1
+        token = self._hide_token
+        self._kwin_ok = False
+        # 1) сначала появляется звезда (внизу по центру, над доком)
+        if self.orb:
+            self.orb.fade_in()
+            threading.Thread(target=kwin_apply, args=([self._orb_geom()],),
+                             kwargs={"tag": "orb"}, daemon=True).start()
+            for d in (120, 300):
+                QTimer.singleShot(d, lambda: threading.Thread(
+                    target=kwin_apply, args=([self._orb_geom()],),
+                    kwargs={"tag": "orb"}, daemon=True).start())
+        # 2) затем попап вырастает из неё (в web-режиме звезда уже давно горит)
+        delay = 380 if self.orb else 40
+        QTimer.singleShot(delay, lambda: self._reveal(token))
+
+    def _reveal(self, token):
+        if token != self._hide_token:
+            return
+        self.show()
+        self._place_default()
+        self.raise_()
+        self.activateWindow()
+        self.view.setFocus(Qt.OtherFocusReason)
+        # позиционирование и keep-above — через KWin, с дожимом (нативный Wayland)
+        self._apply_kwin_until_ok("open ")
+        ox, oy = self._orb_screen_pos()
+        js = (f"window.__orbAt = {{x: {ox - self.x()}, y: {oy - self.y()}}};"
+              f"window.__setOpen && window.__setOpen(true);")
+        self.view.page().runJavaScript(js)
+        QTimer.singleShot(120, self._settle)
+        # 3) попап раскрылся — звезда больше не нужна
+        if self.orb:
+            QTimer.singleShot(1100, lambda: self.orb.fade_out() if token == self._hide_token else None)
+
+    def _settle(self):
+        self.raise_()
+        self.activateWindow()
+
+    def hide_popup(self):
+        self._hide_token += 1
+        token = self._hide_token
+        self._save_geometry()
+        # 1) звезда загорается
+        if self.orb:
+            self.orb.fade_in()
+            threading.Thread(target=kwin_apply, args=([self._orb_geom()],),
+                             kwargs={"tag": "orb"}, daemon=True).start()
+        # 2) попап сворачивается в звезду
+        delay = 220 if self.orb else 40
+        QTimer.singleShot(delay, lambda: self._collapse(token))
+
+    def _collapse(self, token):
+        if token != self._hide_token:
+            return
+        self.view.page().runJavaScript("window.__setOpen && window.__setOpen(false);")
+        # 3) анимация закончилась: прячем окно, затем мягко гасим звезду, затем выходим
+        QTimer.singleShot(650, lambda: self.hide() if token == self._hide_token else None)
+        if self.orb:
+            QTimer.singleShot(780, lambda: self.orb.fade_out() if token == self._hide_token else None)
+        QTimer.singleShot(1400, lambda: self._shutdown(token))
+
+    def _shutdown(self, token):
+        if token != self._hide_token or self.isVisible():
+            return  # успели открыть снова — работаем дальше
+        log("попап закрыт — завершаю процесс")
+        if self.orb:
+            self.orb.hide()
+        proc = getattr(self.backend, "proc", None)
+        if proc is not None:
+            proc.kill()
+        QApplication.quit()
+
+    def toggle(self):
+        if self.isVisible():
+            self.hide_popup()
+        else:
+            self.show_popup()
+
+
+# --------------------------------------------------------------------- main
+
+def notify_existing(cmd: str) -> bool:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(0.3)
+    try:
+        s.connect(str(SOCK_PATH))
+        s.sendall(cmd.encode())
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+# ------------------------------------------------------- web-режим (XWayland)
+
+def run_web():
+    """Дочерний процесс: окно попапа на xcb (XWayland) — только там WebEngine
+    умеет per-pixel alpha (на Wayland — непрозрачная серая подложка, QT 6.11)."""
+    os.environ["QT_QPA_PLATFORM"] = "xcb"
+    QApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
+    app = QApplication(sys.argv)
+    app.setApplicationName("oc-popup")
+    app.setDesktopFileName("oc-popup")
+    if ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(ICON_PATH)))
+    app.setQuitOnLastWindowClosed(False)
+
+    try:
+        SOCK_WEB.unlink()
+    except OSError:
+        pass
+
+    cfg = load_config()
+    state = load_state()
+    host = Host(cfg, state, with_orb=False)
+
+    bus = QDBusConnection.sessionBus()
+    if bus.registerService(TELEMETRY_BUS):
+        host._telemetry = KWinTelemetry(host._kwin_report)
+        ok = bus.registerObject(TELEMETRY_PATH, TELEMETRY_BUS, host._telemetry,
+                                QDBusConnection.ExportAllSlots)
+        log(f"telemetry: регистрация {TELEMETRY_BUS}{TELEMETRY_PATH} ok={ok}")
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(SOCK_WEB))
+    srv.listen(4)
+    srv.setblocking(False)
+
+    def on_conn():
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            return
+        try:
+            conn.settimeout(0.3)
+            data = conn.recv(64).decode(errors="replace").strip()
+        except OSError:
+            data = ""
+        finally:
+            conn.close()
+        if data == "toggle":
+            host.toggle()
+        elif data == "show":
+            host.show_popup()
+        elif data == "hide":
+            host.hide_popup()
+        elif data == "quit":
+            QApplication.quit()
+
+    notifier = QSocketNotifier(srv.fileno(), QSocketNotifier.Read)
+    notifier.activated.connect(on_conn)
+
+    rc = app.exec()
+    try:
+        SOCK_WEB.unlink()
+    except OSError:
+        pass
+    return rc
+
+
+# ------------------------------------------------------- родитель (нативный Wayland)
+
+def _find_xauthority():
+    if os.environ.get("XAUTHORITY"):
+        return os.environ["XAUTHORITY"]
+    import glob
+    for pat in (f"{RUNTIME_DIR}/xauth_*", str(HOME / ".Xauthority")):
+        hits = glob.glob(pat)
+        if hits:
+            return hits[0]
+    return None
+
+
+def run_parent():
+    """Родитель: сокет-управление, звезда-орб (нативный Wayland, QWidget),
+    жизненный цикл веб-ребёнка. Сам попап живёт в ребёнке на XWayland."""
+    os.environ["QT_QPA_PLATFORM"] = "wayland"
+    app = QApplication(sys.argv)
+    app.setApplicationName("oc-popup")
+    app.setDesktopFileName("oc-popup")
+    if ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(ICON_PATH)))
+    app.setQuitOnLastWindowClosed(False)
+
+    if notify_existing("ping"):
+        return 0
+    try:
+        SOCK_PATH.unlink()
+    except OSError:
+        pass
+
+    cfg = load_config()
+    kde = Theme(KDE_GLOBALS)
+
+    def dock_top():
+        scr = QGuiApplication.primaryScreen()
+        g, av = scr.geometry(), scr.availableGeometry()
+        if av.bottom() < g.bottom() - 10:
+            return av.bottom() + 1
+        return g.bottom() + 1 - int(cfg.get("dock_h", 54))
+
+    def orb_geom():
+        g = QGuiApplication.primaryScreen().geometry()
+        S = OrbWin.SIZE
+        x = g.x() + (g.width() - S) // 2
+        y = dock_top() - int(cfg.get("orb_gap", 14)) - S + 6
+        return {"title": "opencode orb", "nofocus": True, "x": x, "y": y,
+                "w": S, "h": S}
+
+    class Parent(QObject):
+        def __init__(self):
+            super().__init__()
+            self.orb = OrbWin(kde, self.toggle)
+            self.orb.orb_bottom = int(cfg.get("orb_bottom", 14))
+            self.orb.pos_fn = lambda: (orb_geom()["x"], orb_geom()["y"])
+            self.orb._place_cb = lambda: (self.orb.place(), self.orb.raise_())
+            self.child = None
+            self.shown = False
+            self.shutting_down = False
+            self._child_gone = False
+
+        # ----- ребёнок
+        def _spawn(self):
+            if self.child is not None and self.child.poll() is None:
+                return True
+            try:
+                SOCK_WEB.unlink()
+            except OSError:
+                pass
+            env = dict(os.environ)
+            env.setdefault("DISPLAY", ":0")
+            xa = _find_xauthority()
+            if xa:
+                env["XAUTHORITY"] = xa
+            self.child = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "--web"],
+                env=env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True, cwd=str(HOME))
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                if self.child.poll() is not None:
+                    log(f"parent: web-ребёнок умер при старте (rc={self.child.returncode})")
+                    return False
+                try:
+                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    s.settimeout(0.3)
+                    s.connect(str(SOCK_WEB))
+                    s.close()
+                    return True
+                except OSError:
+                    time.sleep(0.15)
+            log("parent: сокет web-ребёнка не появился")
+            return False
+
+        def _send_web(self, cmd):
+            try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(0.5)
+                s.connect(str(SOCK_WEB))
+                s.sendall(cmd.encode())
+                s.close()
+                return True
+            except OSError:
+                return False
+
+        def _check_child(self):
+            """Вызывается таймером главного потока."""
+            if self.shutting_down:
+                return
+            # погасить звезду после раскрытия панелей
+            fade_at = getattr(self, "_fade_at", None)
+            if fade_at is not None and time.time() >= fade_at:
+                self._fade_at = None
+                self._fade_orb_if_open()
+            if self._child_gone:
+                return
+            if self.child is not None and self.child.poll() is not None:
+                self._child_gone = True
+                self.shown = False
+                log("parent: web-ребёнок завершён — гасим звезду и выходим")
+                self._after_child_gone()
+
+        def _after_child_gone(self):
+            self.orb.fade_in()  # короткая вспышка звезды на закрытии
+            QTimer.singleShot(200, self.orb.fade_out)
+            QTimer.singleShot(900, QApplication.quit)
+
+        # ----- действия
+        def show(self):
+            self.shown = True
+            self._child_gone = False
+            self.orb.fade_in()
+            threading.Thread(target=kwin_apply, args=([orb_geom()],),
+                             kwargs={"tag": "orb"}, daemon=True).start()
+            for d in (120, 400):
+                QTimer.singleShot(d, lambda: threading.Thread(
+                    target=kwin_apply, args=([orb_geom()],),
+                    kwargs={"tag": "orb"}, daemon=True).start())
+            def web_show():
+                if not self._spawn():
+                    self.shown = False
+                    self.orb.fade_out()
+                    return
+                self._send_web("show")
+                # попап раскрылся — звезда больше не нужна (короткая вспышка)
+                self._fade_at = time.time() + 0.9
+            threading.Thread(target=web_show, daemon=True).start()
+
+        def _fade_orb_if_open(self):
+            if self.shown and not self._child_gone and \
+               self.child is not None and self.child.poll() is None:
+                self.orb.fade_out()
+
+        def hide(self):
+            if not self.shown:
+                return
+            self.shown = False
+            self.orb.fade_in()
+            threading.Thread(target=kwin_apply, args=([orb_geom()],),
+                             kwargs={"tag": "orb"}, daemon=True).start()
+            self._send_web("hide")
+
+        def toggle(self):
+            if self.shown:
+                self.hide()
+            else:
+                self.show()
+
+    parent = Parent()
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(SOCK_PATH))
+    srv.listen(4)
+    srv.setblocking(False)
+
+    def on_conn():
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            return
+        try:
+            conn.settimeout(0.3)
+            data = conn.recv(64).decode(errors="replace").strip()
+        except OSError:
+            data = ""
+        finally:
+            conn.close()
+        if data == "toggle":
+            log(f"socket: toggle (shown={parent.shown})")
+            parent.toggle()
+        elif data == "show":
+            log("socket: show")
+            parent.show()
+        elif data == "hide":
+            log("socket: hide")
+            parent.hide()
+
+    notifier = QSocketNotifier(srv.fileno(), QSocketNotifier.Read)
+    notifier.activated.connect(on_conn)
+
+    # слежение за ребёнком — таймером главного потока (QTimer из python-потока не работает)
+    watcher = QTimer(parent)
+    watcher.setInterval(400)
+    watcher.timeout.connect(parent._check_child)
+    watcher.start()
+
+    if "--show" in sys.argv or "--toggle" in sys.argv:
+        QTimer.singleShot(400, parent.show)
+
+    rc = app.exec()
+    try:
+        SOCK_PATH.unlink()
+    except OSError:
+        pass
+    if parent.child is not None and parent.child.poll() is None:
+        parent._send_web("quit")
+        try:
+            parent.child.wait(timeout=3)
+        except Exception:
+            parent.child.kill()
+    return rc
+
+
+def main():
+    if "--web" in sys.argv:
+        return run_web()
+    return run_parent()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
