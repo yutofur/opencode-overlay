@@ -1833,6 +1833,11 @@ class Host(QWidget):
         if token != self._hide_token or self.isVisible():
             return  # успели открыть снова — работаем дальше
         log("попап закрыт — завершаю процесс")
+        # WebEngine иногда зависает при выходе — жёсткий предохранитель:
+        # daemon-таймер умрёт вместе с процессом, если quit() сработает сам
+        t = threading.Timer(1.5, lambda: os._exit(0))
+        t.daemon = True
+        t.start()
         if self.orb:
             self.orb.hide()
         proc = getattr(self.backend, "proc", None)
@@ -1989,6 +1994,8 @@ def run_parent():
             self.shown = False
             self.shutting_down = False
             self._child_gone = False
+            self._closing = False    # мы попросили ребёнка закрыться — он умирает
+            self._crash = 0          # сколько раз подряд ребёнок умирал открытым
 
         # ----- ребёнок
         def _spawn(self):
@@ -2047,20 +2054,50 @@ def run_parent():
             if self._child_gone:
                 return
             if self.child is not None and self.child.poll() is not None:
+                self._closing = False
+                if self.shown:
+                    # ребёнок умер, а попап должен быть открыт: краш WebEngine
+                    # или гонка закрыть→открыть — поднимаем новый
+                    self._crash += 1
+                    if self._crash <= 3:
+                        log("parent: web-ребёнок умер открытым — перезапускаю "
+                            f"({self._crash}/3)")
+                        threading.Thread(target=self._respawn, daemon=True).start()
+                        return
+                    log("parent: web-ребёнок падает повторно — выходим")
                 self._child_gone = True
                 self.shown = False
                 log("parent: web-ребёнок завершён — гасим звезду и выходим")
                 self._after_child_gone()
 
+        def _respawn(self):
+            if self._spawn():
+                self._send_web("show")
+            else:
+                self._child_gone = True
+                self.shown = False
+                self._after_child_gone()
+
         def _after_child_gone(self):
+            self._child_gone = True
+            self.shutting_down = True
             self.orb.fade_in()  # короткая вспышка звезды на закрытии
             QTimer.singleShot(200, self.orb.fade_out)
-            QTimer.singleShot(900, QApplication.quit)
+            QTimer.singleShot(900, self._quit_check)
+
+        def _quit_check(self):
+            # пользователь успел нажать «открыть» в окно смерти — живём
+            if self.shown:
+                log("parent: отмена выхода — попап переоткрыт")
+                return
+            QApplication.quit()
 
         # ----- действия
         def show(self):
             self.shown = True
             self._child_gone = False
+            self._crash = 0
+            self.shutting_down = False   # отменяем отложенный выход, если был
             self.orb.fade_in()
             threading.Thread(target=kwin_apply, args=([orb_geom()],),
                              kwargs={"tag": "orb"}, daemon=True).start()
@@ -2069,11 +2106,28 @@ def run_parent():
                     target=kwin_apply, args=([orb_geom()],),
                     kwargs={"tag": "orb"}, daemon=True).start())
             def web_show():
+                if self.child is not None and self.child.poll() is None \
+                        and self._closing:
+                    # ребёнок в процессе смерти (WebEngine любит зависать при
+                    # выходе): убиваем и поднимаем свежий — иначе команда
+                    # уйдёт в мёртвый event loop
+                    log("parent: ребёнок ещё умирает — kill и новый экземпляр")
+                    try:
+                        self.child.kill()
+                    except OSError:
+                        pass
+                    for _ in range(20):
+                        if self.child.poll() is not None:
+                            break
+                        time.sleep(0.1)
+                self._closing = False
                 if not self._spawn():
                     self.shown = False
                     self.orb.fade_out()
                     return
-                self._send_web("show")
+                if not self._send_web("show"):
+                    time.sleep(0.4)   # ребёнок мог ещё не повесить сокет
+                    self._send_web("show")
                 # попап раскрылся — звезда больше не нужна (короткая вспышка)
                 self._fade_at = time.time() + 0.9
             threading.Thread(target=web_show, daemon=True).start()
@@ -2087,6 +2141,7 @@ def run_parent():
             if not self.shown:
                 return
             self.shown = False
+            self._closing = True
             self.orb.fade_in()
             threading.Thread(target=kwin_apply, args=([orb_geom()],),
                              kwargs={"tag": "orb"}, daemon=True).start()
